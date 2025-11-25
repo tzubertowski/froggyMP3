@@ -262,10 +262,9 @@ void retro_run(void)
 
         player_tick_scroll(&ui_dirty);
 
-        if (ui_dirty) {
-            player_draw();
-            ui_dirty = 0;
-        }
+        /* always redraw player - progress bar updates continuously */
+        player_draw();
+        ui_dirty = 0;
 
         /* continue background loading */
         player_bg_load();
