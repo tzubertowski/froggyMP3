@@ -41,6 +41,13 @@ uint32_t player_channels  = 2;
 int16_t *player_pcm       = NULL;
 uint16_t player_pcm_fill  = 0;
 
+/* Streaming state */
+static FILE    *player_file   = NULL;
+static char     player_path[MAX_PATH];
+#define STREAM_BUF_SIZE  (64 * 1024)  /* 64KB buffer */
+static uint32_t buf_file_pos  = 0;    /* file offset of buffer start */
+static uint32_t buf_fill      = 0;    /* bytes in buffer */
+
 /* Title scrolling */
 static char  scroll_title[136];
 static int   scroll_offset  = 0;
@@ -67,38 +74,70 @@ static void setup_title(void)
     scroll_delay  = SCROLL_WAIT;
 }
 
+/* Fill stream buffer from current file position */
+static void fill_buffer(uint32_t file_pos)
+{
+    if (!player_file) return;
+
+    fseek(player_file, file_pos, SEEK_SET);
+    buf_fill = fread(player_data, 1, STREAM_BUF_SIZE, player_file);
+    buf_file_pos = file_pos;
+}
+
+/* Get pointer to data at file position, refill buffer if needed */
+char *player_get_data(uint32_t pos, uint32_t need)
+{
+    /* check if requested range is in buffer */
+    if (pos >= buf_file_pos && pos + need <= buf_file_pos + buf_fill)
+        return player_data + (pos - buf_file_pos);
+
+    /* need to refill - position buffer so requested data is near start */
+    fill_buffer(pos);
+
+    if (buf_fill == 0) return NULL;
+    return player_data;
+}
+
 int player_load(const char *path)
 {
-    FILE *f;
     ID3Hdr hdr;
-    char *tmp;
+    char *tmp, *data;
     int rd, done, len;
 
-    f = fopen(path, "rb");
-    if (!f) return 0;
-
-    fseek(f, 0, SEEK_END);
-    player_len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (player_data) {
-        free(player_data);
-        player_data = NULL;
+    /* close previous file */
+    if (player_file) {
+        fclose(player_file);
+        player_file = NULL;
     }
 
-    player_data = malloc(player_len);
+    player_file = fopen(path, "rb");
+    if (!player_file) return 0;
+
+    strncpy(player_path, path, MAX_PATH - 1);
+    player_path[MAX_PATH - 1] = '\0';
+
+    fseek(player_file, 0, SEEK_END);
+    player_len = ftell(player_file);
+    fseek(player_file, 0, SEEK_SET);
+
+    /* allocate stream buffer */
     if (!player_data) {
-        fclose(f);
-        return 0;
+        player_data = malloc(STREAM_BUF_SIZE);
+        if (!player_data) {
+            fclose(player_file);
+            player_file = NULL;
+            return 0;
+        }
     }
 
-    fread(player_data, 1, player_len, f);
-    fclose(f);
+    /* read first chunk */
+    buf_file_pos = 0;
+    buf_fill = fread(player_data, 1, STREAM_BUF_SIZE, player_file);
 
     player_pos = 0;
 
     /* skip ID3 tag */
-    if (player_len > 10) {
+    if (player_len > 10 && buf_fill >= 10) {
         memcpy(&hdr, player_data, 10);
         if (hdr.id[0] == 'I' && hdr.id[1] == 'D' && hdr.id[2] == '3') {
             player_pos = (hdr.size[0] & 0x7f);
@@ -119,9 +158,10 @@ int player_load(const char *path)
 
     /* probe first frame for metadata */
     len = (player_len - player_pos > 4096) ? 4096 : (player_len - player_pos);
+    data = player_get_data(player_pos, len);
     tmp = malloc(32768);
-    if (tmp) {
-        if (mad_decode(player_mad, player_data + player_pos, len,
+    if (tmp && data) {
+        if (mad_decode(player_mad, data, len,
                        tmp, 32768, &rd, &done, 16, 0) == MAD_OK || done > 0) {
             player_rate     = mad_get_samplerate(player_mad);
             player_bitrate  = mad_get_bitrate(player_mad);
@@ -130,7 +170,6 @@ int player_load(const char *path)
         free(tmp);
         mad_uninit(player_mad);
         player_mad = mad_init();
-        player_pos = player_start;
     }
 
     player_paused = 0;
@@ -143,13 +182,15 @@ void player_unload(void)
         mad_uninit(player_mad);
         player_mad = NULL;
     }
-    if (player_data) {
-        free(player_data);
-        player_data = NULL;
+    if (player_file) {
+        fclose(player_file);
+        player_file = NULL;
     }
+    /* keep buffer allocated for reuse */
     player_len = 0;
     player_pos = 0;
     player_pcm_fill = 0;
+    buf_fill = 0;
 }
 
 void player_seek(int secs)
@@ -391,5 +432,5 @@ void player_draw(void)
     /* legend */
     leg_y = SCREEN_H - 24;
     ui_legend_btn(10, leg_y, " Y/X - PREV/NEXT ");
-    ui_legend_btn(SCREEN_W - 85, leg_y, " START - BACK ");
+    ui_legend_btn(SCREEN_W - 40, leg_y, " B ");
 }

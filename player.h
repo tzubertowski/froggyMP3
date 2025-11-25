@@ -30,10 +30,11 @@ extern int16_t *player_pcm;
 extern uint16_t player_pcm_fill;
 
 /* Core operations */
-int  player_load(const char *path);
-void player_unload(void);
-void player_seek(int secs);
-void player_toggle_pause(void);
+int   player_load(const char *path);
+void  player_unload(void);
+void  player_seek(int secs);
+void  player_toggle_pause(void);
+char *player_get_data(uint32_t pos, uint32_t need);
 
 /* Playback control */
 void player_play_at(int idx);

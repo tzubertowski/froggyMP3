@@ -268,12 +268,13 @@ void retro_run(void)
         }
 
         /* audio decode */
-        if (!player_paused && player_mad && player_data) {
+        if (!player_paused && player_mad && player_len > 0) {
             int err = 0;
 
             while (player_pcm_fill <= need_bytes) {
                 int len = 2048;
                 int rd, done;
+                char *data;
 
                 if (player_pos + len > player_len) {
                     len = player_len - player_pos;
@@ -283,7 +284,13 @@ void retro_run(void)
                     }
                 }
 
-                mad_decode(player_mad, player_data + player_pos, len,
+                data = player_get_data(player_pos, len);
+                if (!data) {
+                    player_on_end();
+                    break;
+                }
+
+                mad_decode(player_mad, data, len,
                            (char *)player_pcm + player_pcm_fill, 10000,
                            &rd, &done, 16, 0);
 
