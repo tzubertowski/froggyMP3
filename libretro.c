@@ -6,12 +6,17 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
+#ifdef SF2000
+#include "dirent.h"
+#else
+#include <dirent.h>
+#endif
 #include <retro_endianness.h>
 #include <streams/file_stream.h>
 #include <libretro.h>
 
 #include "platform.h"
-
+#include "font.h"
 #include "libmad/libmad.h"
 
 #ifdef ABGR1555
@@ -22,32 +27,77 @@
 
 #define FPS 50
 
-static void *mp3Mad     = NULL;  //mp3Mad instance
+// MinUI Style Colors (black bg, white text, white pillbox selection with black text)
+#define RGB565(r, g, b) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
+#define COLOR_BG          RGB565(0, 0, 0)
+#define COLOR_TEXT        RGB565(255, 255, 255)
+#define COLOR_SELECT_BG   RGB565(255, 255, 255)
+#define COLOR_SELECT_TEXT RGB565(0, 0, 0)
+#define COLOR_HEADER      RGB565(132, 132, 132)
+#define COLOR_FOLDER      RGB565(255, 255, 255)
+#define COLOR_LEGEND      RGB565(255, 255, 255)
+#define COLOR_LEGEND_BG   RGB565(33, 33, 33)
+#define COLOR_DISABLED    RGB565(132, 132, 132)
+#define COLOR_PROGRESS_BG RGB565(33, 33, 33)
+#define COLOR_PROGRESS    RGB565(255, 255, 255)
 
-static char *mp3        = NULL;  //mp3 file data
-static u32 mp3Length    = 0;     //length of mp3 file data
-static u32 mp3Position  = 0;     //current position in reading mp3 file data
-static u32 mp3StartPosition = 0; //position after ID3 tag (for restarting decode)
+// Screen dimensions
+#define SCREEN_WIDTH 320
+#define SCREEN_HEIGHT 240
 
+// UI Constants
+#define MAX_FILES 256
+#define MAX_PATH_LEN 512
+#define MAX_NAME_LEN 128
+#define VISIBLE_ITEMS 8
+#define ITEM_HEIGHT 24
+#define HEADER_HEIGHT 30
+#define START_Y 36
+#define PADDING 10
+
+// App states
+typedef enum {
+    STATE_BROWSER,
+    STATE_PLAYING
+} AppState;
+
+// File entry
+typedef struct {
+    char name[MAX_NAME_LEN];
+    int is_dir;
+} FileEntry;
+
+// Browser state
+static AppState app_state = STATE_BROWSER;
+static char current_path[MAX_PATH_LEN] = "/mnt/sda1/ROMS/MP3";
+static FileEntry file_list[MAX_FILES];
+static int file_count = 0;
+static int selected_index = 0;
+static int scroll_offset = 0;
+
+// MP3 player state
+static void *mp3Mad     = NULL;
+static char *mp3        = NULL;
+static u32 mp3Length    = 0;
+static u32 mp3Position  = 0;
+static u32 mp3StartPosition = 0;
 static s16 *soundBuffer = NULL;
 static u16 soundEnd     = 0;
+static u8 kpause        = 0;
+static u32 mp3SampleRate = 44100;
+static u32 mp3Bitrate    = 0;
+static u32 mp3Channels   = 2;
+static char current_song[MAX_NAME_LEN] = "";
 
-static u8 kpause        = 0;     //is core paused
+// Framebuffer
+u16 pixels[SCREEN_WIDTH * SCREEN_HEIGHT];
 
-static u32 mp3SampleRate = 44100; //sample rate from MP3 file (default 44100)
-static u32 mp3Bitrate    = 0;     //bitrate from MP3 file
-static u32 mp3Channels   = 2;     //channels from MP3 file
-
-u16 pixels[320 * 240];       //framebuffer 1 (main fb for karakoke text)
-
+// Callbacks
 static void fallback_log(enum retro_log_level level, const char *fmt, ...);
-
 retro_log_printf_t log_cb = fallback_log;
 retro_video_refresh_t video_cb;
-
 static retro_audio_sample_t audio_cb;
 static retro_audio_sample_batch_t audio_batch_cb;
-
 retro_environment_t environ_cb;
 static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
@@ -55,527 +105,914 @@ static retro_input_state_t input_state_cb;
 int width, height;
 
 #pragma pack(1)
-
-typedef struct
-{
+typedef struct {
    u8 identifier[3];
    u16 version;
    u8 flags;
    u8 lengthSyncSafe[4];
 } id3Header;
-
 #pragma pack()
 
-//  KfDirect555 = xRRRRRGG.GGGBBBBB
-//  Red         = xRRRRRxx.xxxxxxxx
-//  Green       = xxxxxxGG.GGGxxxxx
-//  Blue        = xxxxxxxx.xxxBBBBB
+// Input tracking
+static int key_pressed[16] = {0};
+static int key_just_pressed[16] = {0};
 
-// Blend image with background, based on opacity
-// Code optimization from http://www.gamedev.net/reference/articles/article817.asp
-// result = destPixel + ((srcPixel - destPixel) * ALPHA) / 256
-static u16 AlphaBlend(u16 pixel, u16 backpixel, u16 opacity)
-{
-   u32 dwAlphaRBtemp = (backpixel & 0xf81f);
-   u32 dwAlphaGtemp  = (backpixel & 0x07e0);
-   u32 dw6bitOpacity = (opacity >> 2);
+// UI dirty flag - only re-render when needed
+static int ui_dirty = 1;
 
-   return (
-         ((dwAlphaRBtemp + ((((pixel & 0xf81f) - dwAlphaRBtemp) * dw6bitOpacity) >> 6)) & 0xf81f) |
-         ((dwAlphaGtemp + ((((pixel & 0x07e0) - dwAlphaGtemp) * dw6bitOpacity) >> 6)) & 0x07e0)
-         );
+// Scrolling text for player
+static int title_scroll_offset = 0;
+static int title_scroll_delay = 0;
+static int title_needs_scroll = 0;
+static char scrolling_title[MAX_NAME_LEN + 8]; // Extra space for padding
+#define SCROLL_DELAY_FRAMES 30  // Pause at start/end
+#define SCROLL_SPEED 1          // Pixels per frame
+#define TITLE_MAX_WIDTH 280     // Max visible width for title
+
+// Forward declarations
+static void scan_directory(void);
+static void render_browser(void);
+static void render_player(void);
+static void clear_screen(uint16_t color);
+static void fill_rect(int x, int y, int w, int h, uint16_t color);
+static void render_rounded_rect(int x, int y, int w, int h, int radius, uint16_t color);
+static void render_text_pillbox(int x, int y, const char *text, uint16_t bg_color, uint16_t text_color, int padding);
+static int load_mp3_file(const char *path);
+static void unload_mp3(void);
+static void seek_mp3(int seconds);
+
+// Compare function for sorting (directories first, then alphabetical)
+static int compare_entries(const void *a, const void *b) {
+    const FileEntry *ea = (const FileEntry *)a;
+    const FileEntry *eb = (const FileEntry *)b;
+
+    // ".." always first
+    if (strcmp(ea->name, "..") == 0) return -1;
+    if (strcmp(eb->name, "..") == 0) return 1;
+
+    // Directories before files
+    if (ea->is_dir && !eb->is_dir) return -1;
+    if (!ea->is_dir && eb->is_dir) return 1;
+
+    // Alphabetical (case insensitive)
+    return strcasecmp(ea->name, eb->name);
 }
 
-static bool retro_load_game_internal(const char *mp3_filename)
-{
-   FILE *fic = NULL;
-   log_cb(RETRO_LOG_INFO, "[froggymp3] load_game_internal: opening %s\n", mp3_filename);
-
-   fic = fopen(mp3_filename, "rb");          //open file (for reading in binary mode)
-   if (!fic) {
-      log_cb(RETRO_LOG_ERROR, "[froggymp3] failed to open file\n");
-      return false;
-   }
-   log_cb(RETRO_LOG_INFO, "[froggymp3] file opened successfully\n");
-
-   fseek(fic, 0, SEEK_END);                  //get where the file ends
-   mp3Length = ftell(fic);                   //save mp3 file length
-   log_cb(RETRO_LOG_INFO, "[froggymp3] file length: %u\n", mp3Length);
-
-   fseek(fic, 0, SEEK_SET);                  //back to mp3 file beginning
-   if (!(mp3 = (char *)malloc(mp3Length))) {  //allocate mp3 file size amount of memory
-      log_cb(RETRO_LOG_ERROR, "[froggymp3] failed to allocate %u bytes\n", mp3Length);
-      fclose(fic);
-      return false;
-   }
-   log_cb(RETRO_LOG_INFO, "[froggymp3] allocated %u bytes at %p\n", mp3Length, mp3);
-
-   fread(mp3, 1, mp3Length, fic);            //read file data into variable
-   fclose(fic);                              //close file
-   log_cb(RETRO_LOG_INFO, "[froggymp3] file read complete\n");
-
-   mp3Position = 0;
-
-   if (mp3Length > 10) /* Skip ID3 Tag */
-   {
-      id3Header header;
-      memcpy(&header, mp3, 10);
-
-      if ((header.identifier[0] == 0x49) && (header.identifier[1] == 0x44) && (header.identifier[2] == 0x33))
-      {
-         mp3Position = (header.lengthSyncSafe[0] & 0x7f);
-         mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[1] & 0x7f);
-         mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[2] & 0x7f);
-         mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[3] & 0x7f);
-
-         log_cb(RETRO_LOG_INFO, "[froggymp3] id3 tag length: %u\n", mp3Position);
-
-         mp3Position = mp3Position + 10;
-      }
-   }
-   log_cb(RETRO_LOG_INFO, "[froggymp3] mp3 data starts at position: %u\n", mp3Position);
-
-   mp3StartPosition = mp3Position;           //save start position for later use
-   log_cb(RETRO_LOG_INFO, "[froggymp3] calling mad_init()\n");
-   mp3Mad = mad_init();                      //init libmad for mp3 decoding
-   if (!mp3Mad) {
-      log_cb(RETRO_LOG_ERROR, "[froggymp3] mad_init() failed!\n");
-      return false;
-   }
-   log_cb(RETRO_LOG_INFO, "[froggymp3] mad_init() returned %p\n", mp3Mad);
-   soundEnd = 0;
-
-   // Decode first frame to get sample rate, bitrate, and channels
-   log_cb(RETRO_LOG_INFO, "[froggymp3] decoding first frame for metadata...\n");
-   {
-      int read = 0, done = 0;
-      int length = (mp3Length - mp3Position > 4096) ? 4096 : (mp3Length - mp3Position);
-      log_cb(RETRO_LOG_INFO, "[froggymp3] probe length: %d\n", length);
-
-      char *tempBuffer = (char *)malloc(32768);
-      log_cb(RETRO_LOG_INFO, "[froggymp3] tempBuffer allocated at %p\n", tempBuffer);
-
-      if (tempBuffer) {
-         log_cb(RETRO_LOG_INFO, "[froggymp3] calling mad_decode() for probe...\n");
-         int retour = mad_decode(mp3Mad, mp3 + mp3Position, length,
-                                 tempBuffer, 32768, &read, &done, 16, 0);
-         log_cb(RETRO_LOG_INFO, "[froggymp3] mad_decode returned %d, read=%d, done=%d\n", retour, read, done);
-
-         if (retour == MAD_OK || done > 0) {
-            log_cb(RETRO_LOG_INFO, "[froggymp3] getting sample rate...\n");
-            mp3SampleRate = mad_get_samplerate(mp3Mad);
-            log_cb(RETRO_LOG_INFO, "[froggymp3] samplerate=%u\n", mp3SampleRate);
-
-            log_cb(RETRO_LOG_INFO, "[froggymp3] getting bitrate...\n");
-            mp3Bitrate = mad_get_bitrate(mp3Mad);
-            log_cb(RETRO_LOG_INFO, "[froggymp3] bitrate=%u\n", mp3Bitrate);
-
-            log_cb(RETRO_LOG_INFO, "[froggymp3] getting channels...\n");
-            mp3Channels = mad_get_channels(mp3Mad);
-            log_cb(RETRO_LOG_INFO, "[froggymp3] channels=%u\n", mp3Channels);
-
-            log_cb(RETRO_LOG_INFO, "[froggymp3] MP3 info: samplerate=%u, bitrate=%u, channels=%u\n",
-                   mp3SampleRate, mp3Bitrate, mp3Channels);
-         } else {
-            log_cb(RETRO_LOG_WARN, "[froggymp3] probe decode failed, using defaults\n");
-         }
-
-         log_cb(RETRO_LOG_INFO, "[froggymp3] freeing tempBuffer\n");
-         free(tempBuffer);
-
-         // Reset decoder for clean playback
-         log_cb(RETRO_LOG_INFO, "[froggymp3] resetting decoder...\n");
-         mad_uninit(mp3Mad);
-         log_cb(RETRO_LOG_INFO, "[froggymp3] mad_uninit done, calling mad_init again...\n");
-         mp3Mad = mad_init();
-         log_cb(RETRO_LOG_INFO, "[froggymp3] new mp3Mad=%p\n", mp3Mad);
-         mp3Position = mp3StartPosition;
-         log_cb(RETRO_LOG_INFO, "[froggymp3] reset mp3Position to %u\n", mp3Position);
-      } else {
-         log_cb(RETRO_LOG_WARN, "[froggymp3] failed to allocate tempBuffer, using defaults\n");
-      }
-   }
-
-   log_cb(RETRO_LOG_INFO, "[froggymp3] load_game_internal complete, returning true\n");
-   return true;
+// Check if file has .mp3 extension
+static int is_mp3_file(const char *name) {
+    int len = strlen(name);
+    if (len < 4) return 0;
+    const char *ext = name + len - 4;
+    return (strcasecmp(ext, ".mp3") == 0);
 }
 
-static void fallback_log(enum retro_log_level level, const char *fmt, ...)
-{
-   va_list va;
-   va_start(va, fmt);
-   vfprintf(stderr, fmt, va);
-   va_end(va);
+// Scan current directory for MP3 files and subdirectories
+static void scan_directory(void) {
+    DIR *dir;
+    struct dirent *ent;
+
+    file_count = 0;
+    selected_index = 0;
+    scroll_offset = 0;
+
+    dir = opendir(current_path);
+    if (!dir) {
+        log_cb(RETRO_LOG_ERROR, "[froggymp3] Failed to open directory: %s\n", current_path);
+        return;
+    }
+
+    // Add parent directory entry if not at root
+    if (strcmp(current_path, "/") != 0 && strcmp(current_path, "/mnt/sda1") != 0) {
+        strcpy(file_list[file_count].name, "..");
+        file_list[file_count].is_dir = 1;
+        file_count++;
+    }
+
+    while ((ent = readdir(dir)) != NULL && file_count < MAX_FILES) {
+        // Skip hidden files and . / ..
+        if (ent->d_name[0] == '.') continue;
+
+        // Check if directory or MP3 file
+        if (ent->d_type == DT_DIR || ent->d_type == DTYPE_DIRECTORY) {
+            strncpy(file_list[file_count].name, ent->d_name, MAX_NAME_LEN - 1);
+            file_list[file_count].name[MAX_NAME_LEN - 1] = '\0';
+            file_list[file_count].is_dir = 1;
+            file_count++;
+        } else if (is_mp3_file(ent->d_name)) {
+            strncpy(file_list[file_count].name, ent->d_name, MAX_NAME_LEN - 1);
+            file_list[file_count].name[MAX_NAME_LEN - 1] = '\0';
+            file_list[file_count].is_dir = 0;
+            file_count++;
+        }
+    }
+
+    closedir(dir);
+
+    // Sort entries
+    if (file_count > 1) {
+        qsort(file_list, file_count, sizeof(FileEntry), compare_entries);
+    }
+
+    log_cb(RETRO_LOG_INFO, "[froggymp3] Found %d entries in %s\n", file_count, current_path);
+}
+
+// Navigate to parent directory
+static void go_parent_directory(void) {
+    char *last_slash = strrchr(current_path, '/');
+    if (last_slash && last_slash != current_path) {
+        *last_slash = '\0';
+    }
+    scan_directory();
+}
+
+// Navigate into a directory
+static void enter_directory(const char *name) {
+    if (strcmp(name, "..") == 0) {
+        go_parent_directory();
+        return;
+    }
+
+    char new_path[MAX_PATH_LEN];
+    snprintf(new_path, MAX_PATH_LEN, "%s/%s", current_path, name);
+    strncpy(current_path, new_path, MAX_PATH_LEN - 1);
+    current_path[MAX_PATH_LEN - 1] = '\0';
+    scan_directory();
+}
+
+// Clear screen
+static void clear_screen(uint16_t color) {
+    for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
+        pixels[i] = color;
+    }
+}
+
+// Fill rectangle
+static void fill_rect(int x, int y, int w, int h, uint16_t color) {
+    for (int py = y; py < y + h && py < SCREEN_HEIGHT; py++) {
+        if (py < 0) continue;
+        for (int px = x; px < x + w && px < SCREEN_WIDTH; px++) {
+            if (px < 0) continue;
+            pixels[py * SCREEN_WIDTH + px] = color;
+        }
+    }
+}
+
+// Rounded rectangle (pill shape)
+static void render_rounded_rect(int x, int y, int w, int h, int radius, uint16_t color) {
+    // Draw main body (excluding corners)
+    fill_rect(x + radius, y, w - 2 * radius, h, color);
+    fill_rect(x, y + radius, w, h - 2 * radius, color);
+
+    // Draw rounded corners using circle approximation
+    for (int corner_y = 0; corner_y < radius; corner_y++) {
+        for (int corner_x = 0; corner_x < radius; corner_x++) {
+            int dx = radius - corner_x;
+            int dy = radius - corner_y;
+            int dist_sq = dx * dx + dy * dy;
+            int radius_sq = radius * radius;
+
+            if (dist_sq <= radius_sq) {
+                // Top-left corner
+                int px = x + corner_x;
+                int py_pos = y + corner_y;
+                if (px >= 0 && px < SCREEN_WIDTH && py_pos >= 0 && py_pos < SCREEN_HEIGHT) {
+                    pixels[py_pos * SCREEN_WIDTH + px] = color;
+                }
+
+                // Top-right corner
+                px = x + w - 1 - corner_x;
+                py_pos = y + corner_y;
+                if (px >= 0 && px < SCREEN_WIDTH && py_pos >= 0 && py_pos < SCREEN_HEIGHT) {
+                    pixels[py_pos * SCREEN_WIDTH + px] = color;
+                }
+
+                // Bottom-left corner
+                px = x + corner_x;
+                py_pos = y + h - 1 - corner_y;
+                if (px >= 0 && px < SCREEN_WIDTH && py_pos >= 0 && py_pos < SCREEN_HEIGHT) {
+                    pixels[py_pos * SCREEN_WIDTH + px] = color;
+                }
+
+                // Bottom-right corner
+                px = x + w - 1 - corner_x;
+                py_pos = y + h - 1 - corner_y;
+                if (px >= 0 && px < SCREEN_WIDTH && py_pos >= 0 && py_pos < SCREEN_HEIGHT) {
+                    pixels[py_pos * SCREEN_WIDTH + px] = color;
+                }
+            }
+        }
+    }
+}
+
+// Text pillbox (rounded background behind text)
+static void render_text_pillbox(int x, int y, const char *text, uint16_t bg_color, uint16_t text_color, int padding) {
+    int text_width = font_measure_text(text);
+    int text_height = FONT_CHAR_HEIGHT;
+
+    int left_padding = 6;
+    int pillbox_width = text_width + left_padding + padding;
+    int pillbox_height = text_height + padding;
+    int pillbox_x = x - left_padding;
+    int pillbox_y = y - (padding / 2);
+
+    render_rounded_rect(pillbox_x, pillbox_y, pillbox_width, pillbox_height, 8, bg_color);
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, x, y, text, text_color);
+}
+
+// Render legend button with pillbox
+static void render_legend_button(int x, int y, const char *text) {
+    int text_width = font_measure_text(text);
+    render_rounded_rect(x - 4, y - 2, text_width + 8, 20, 10, COLOR_LEGEND_BG);
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, x, y, text, COLOR_LEGEND);
+}
+
+// Draw text with horizontal clipping (for scrolling)
+static void draw_text_clipped(int x, int y, const char *text, uint16_t color,
+                              int clip_x, int clip_width, int scroll_offset) {
+    // Draw text at offset position, clipped to region
+    int draw_x = x - scroll_offset;
+
+    // Simple approach: draw full text then we rely on screen bounds
+    // For proper clipping, we'd need per-character logic
+    // This works because font_draw_char already clips to screen bounds
+
+    // Temporarily adjust draw position
+    int text_width = font_measure_text(text);
+
+    // Only draw if some part is visible
+    if (draw_x + text_width < clip_x || draw_x > clip_x + clip_width) {
+        return;
+    }
+
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, draw_x, y, text, color);
+}
+
+// Render file browser
+static void render_browser(void) {
+    clear_screen(COLOR_BG);
+
+    // Header
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, PADDING, 8, "MP3", COLOR_HEADER);
+
+    // File list
+    int visible_start = scroll_offset;
+    int visible_end = scroll_offset + VISIBLE_ITEMS;
+    if (visible_end > file_count) visible_end = file_count;
+
+    for (int i = visible_start; i < visible_end; i++) {
+        int y = START_Y + (i - scroll_offset) * ITEM_HEIGHT;
+        int is_selected = (i == selected_index);
+
+        // File/folder display name
+        char display_name[MAX_NAME_LEN + 4];
+        if (file_list[i].is_dir) {
+            snprintf(display_name, sizeof(display_name), "[%s]", file_list[i].name);
+        } else {
+            strncpy(display_name, file_list[i].name, MAX_NAME_LEN);
+            display_name[MAX_NAME_LEN] = '\0';
+        }
+
+        // Truncate long names
+        if (strlen(display_name) > 26) {
+            display_name[23] = '.';
+            display_name[24] = '.';
+            display_name[25] = '.';
+            display_name[26] = '\0';
+        }
+
+        // Draw with pillbox if selected
+        if (is_selected) {
+            render_text_pillbox(PADDING, y, display_name, COLOR_SELECT_BG, COLOR_SELECT_TEXT, 7);
+        } else {
+            uint16_t text_color = file_list[i].is_dir ? COLOR_FOLDER : COLOR_TEXT;
+            font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, PADDING, y, display_name, text_color);
+        }
+    }
+
+    // Scroll indicator
+    if (file_count > VISIBLE_ITEMS) {
+        int scroll_height = (VISIBLE_ITEMS * ITEM_HEIGHT * VISIBLE_ITEMS) / file_count;
+        if (scroll_height < 10) scroll_height = 10;
+        int max_scroll = file_count - VISIBLE_ITEMS;
+        if (max_scroll > 0) {
+            int scroll_y = START_Y + (scroll_offset * (VISIBLE_ITEMS * ITEM_HEIGHT - scroll_height)) / max_scroll;
+            fill_rect(SCREEN_WIDTH - 4, scroll_y, 3, scroll_height, COLOR_DISABLED);
+        }
+    }
+
+    // Legend at bottom
+    int legend_y = SCREEN_HEIGHT - 24;
+    render_legend_button(SCREEN_WIDTH - 90, legend_y, " A - SELECT ");
+}
+
+// Render player screen
+static void render_player(void) {
+    clear_screen(COLOR_BG);
+
+    // Header
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, PADDING, 8, "NOW PLAYING", COLOR_HEADER);
+
+    // Song name - scrolling if too long
+    int title_y = 70;
+    int title_width = font_measure_text(scrolling_title);
+
+    if (title_width <= TITLE_MAX_WIDTH) {
+        // Center if fits
+        int text_x = (SCREEN_WIDTH - title_width) / 2;
+        font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, text_x, title_y, scrolling_title, COLOR_TEXT);
+    } else {
+        // Scrolling - draw centered on the visible portion
+        int text_x = (SCREEN_WIDTH - TITLE_MAX_WIDTH) / 2;
+        draw_text_clipped(text_x + title_scroll_offset, title_y, scrolling_title, COLOR_TEXT,
+                          text_x, TITLE_MAX_WIDTH, title_scroll_offset);
+    }
+
+    // Progress bar with rounded ends
+    int bar_y = 120;
+    int bar_height = 8;
+    int bar_width = SCREEN_WIDTH - PADDING * 4;
+    int bar_x = PADDING * 2;
+
+    // Background bar
+    render_rounded_rect(bar_x, bar_y, bar_width, bar_height, 4, COLOR_PROGRESS_BG);
+
+    // Progress fill
+    if (mp3Length > mp3StartPosition) {
+        int progress_width = ((mp3Position - mp3StartPosition) * bar_width) / (mp3Length - mp3StartPosition);
+        if (progress_width > 8) {
+            render_rounded_rect(bar_x, bar_y, progress_width, bar_height, 4, COLOR_PROGRESS);
+        } else if (progress_width > 0) {
+            fill_rect(bar_x, bar_y, progress_width, bar_height, COLOR_PROGRESS);
+        }
+    }
+
+    // Seek and Play/Pause controls in a row
+    int controls_y = 153;
+
+    // Left seek: "< 5S"
+    const char *seek_left = "< 5S";
+    int seek_left_width = font_measure_text(seek_left);
+    int seek_left_x = 30;
+    render_rounded_rect(seek_left_x - 4, controls_y - 3, seek_left_width + 8, 22, 10, COLOR_LEGEND_BG);
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, seek_left_x, controls_y, seek_left, COLOR_LEGEND);
+
+    // Play/Pause status (centered)
+    const char *status = kpause ? " PAUSED " : " PLAYING ";
+    int status_width = font_measure_text(status);
+    int status_x = (SCREEN_WIDTH - status_width) / 2;
+    render_rounded_rect(status_x - 4, controls_y - 3, status_width + 8, 22, 10,
+                       kpause ? COLOR_LEGEND_BG : COLOR_SELECT_BG);
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, status_x, controls_y, status,
+                  kpause ? COLOR_DISABLED : COLOR_SELECT_TEXT);
+
+    // Right seek: "5S >"
+    const char *seek_right = "5S >";
+    int seek_right_width = font_measure_text(seek_right);
+    int seek_right_x = SCREEN_WIDTH - seek_right_width - 30;
+    render_rounded_rect(seek_right_x - 4, controls_y - 3, seek_right_width + 8, 22, 10, COLOR_LEGEND_BG);
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, seek_right_x, controls_y, seek_right, COLOR_LEGEND);
+
+    // Legend at bottom - centered single button
+    int legend_y = SCREEN_HEIGHT - 24;
+    const char *menu_text = " B - MENU ";
+    int menu_width = font_measure_text(menu_text);
+    int menu_x = (SCREEN_WIDTH - menu_width) / 2;
+    render_legend_button(menu_x, legend_y, menu_text);
+}
+
+// Load MP3 file
+static int load_mp3_file(const char *path) {
+    FILE *fic = NULL;
+    log_cb(RETRO_LOG_INFO, "[froggymp3] Loading: %s\n", path);
+
+    fic = fopen(path, "rb");
+    if (!fic) {
+        log_cb(RETRO_LOG_ERROR, "[froggymp3] Failed to open file\n");
+        return 0;
+    }
+
+    fseek(fic, 0, SEEK_END);
+    mp3Length = ftell(fic);
+    fseek(fic, 0, SEEK_SET);
+
+    if (mp3) {
+        free(mp3);
+        mp3 = NULL;
+    }
+
+    mp3 = (char *)malloc(mp3Length);
+    if (!mp3) {
+        log_cb(RETRO_LOG_ERROR, "[froggymp3] Failed to allocate memory\n");
+        fclose(fic);
+        return 0;
+    }
+
+    fread(mp3, 1, mp3Length, fic);
+    fclose(fic);
+
+    mp3Position = 0;
+
+    // Skip ID3 tag
+    if (mp3Length > 10) {
+        id3Header header;
+        memcpy(&header, mp3, 10);
+
+        if ((header.identifier[0] == 0x49) && (header.identifier[1] == 0x44) && (header.identifier[2] == 0x33)) {
+            mp3Position = (header.lengthSyncSafe[0] & 0x7f);
+            mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[1] & 0x7f);
+            mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[2] & 0x7f);
+            mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[3] & 0x7f);
+            mp3Position = mp3Position + 10;
+        }
+    }
+
+    mp3StartPosition = mp3Position;
+
+    if (mp3Mad) {
+        mad_uninit(mp3Mad);
+    }
+    mp3Mad = mad_init();
+    if (!mp3Mad) {
+        log_cb(RETRO_LOG_ERROR, "[froggymp3] mad_init() failed\n");
+        return 0;
+    }
+
+    soundEnd = 0;
+
+    // Decode first frame to get metadata
+    {
+        int read = 0, done = 0;
+        int length = (mp3Length - mp3Position > 4096) ? 4096 : (mp3Length - mp3Position);
+        char *tempBuffer = (char *)malloc(32768);
+
+        if (tempBuffer) {
+            int retour = mad_decode(mp3Mad, mp3 + mp3Position, length,
+                                    tempBuffer, 32768, &read, &done, 16, 0);
+
+            if (retour == MAD_OK || done > 0) {
+                mp3SampleRate = mad_get_samplerate(mp3Mad);
+                mp3Bitrate = mad_get_bitrate(mp3Mad);
+                mp3Channels = mad_get_channels(mp3Mad);
+                log_cb(RETRO_LOG_INFO, "[froggymp3] MP3: %dHz, %dbps, %dch\n",
+                       mp3SampleRate, mp3Bitrate, mp3Channels);
+            }
+
+            free(tempBuffer);
+
+            // Reset decoder
+            mad_uninit(mp3Mad);
+            mp3Mad = mad_init();
+            mp3Position = mp3StartPosition;
+        }
+    }
+
+    kpause = 0;
+    return 1;
+}
+
+// Initialize scrolling title from current_song
+static void init_scrolling_title(void) {
+    // Copy song name and remove .mp3 extension
+    strncpy(scrolling_title, current_song, MAX_NAME_LEN - 1);
+    scrolling_title[MAX_NAME_LEN - 1] = '\0';
+
+    int len = strlen(scrolling_title);
+    if (len > 4 && strcasecmp(scrolling_title + len - 4, ".mp3") == 0) {
+        scrolling_title[len - 4] = '\0';
+    }
+
+    // Check if scrolling is needed
+    int title_width = font_measure_text(scrolling_title);
+    title_needs_scroll = (title_width > TITLE_MAX_WIDTH);
+    title_scroll_offset = 0;
+    title_scroll_delay = SCROLL_DELAY_FRAMES;
+}
+
+// Unload current MP3
+static void unload_mp3(void) {
+    if (mp3Mad) {
+        mad_uninit(mp3Mad);
+        mp3Mad = NULL;
+    }
+    if (mp3) {
+        free(mp3);
+        mp3 = NULL;
+    }
+    mp3Length = 0;
+    mp3Position = 0;
+    soundEnd = 0;
+}
+
+// Seek MP3 by seconds (positive = forward, negative = backward)
+static void seek_mp3(int seconds) {
+    if (!mp3 || mp3Length == 0 || mp3Bitrate == 0) return;
+
+    // Estimate bytes per second from bitrate
+    int bytes_per_second = mp3Bitrate / 8;
+    int seek_bytes = seconds * bytes_per_second;
+
+    int new_position = (int)mp3Position + seek_bytes;
+
+    if (new_position < (int)mp3StartPosition) {
+        new_position = mp3StartPosition;
+    }
+    if (new_position >= (int)mp3Length) {
+        new_position = mp3Length - 1024;
+        if (new_position < (int)mp3StartPosition) {
+            new_position = mp3StartPosition;
+        }
+    }
+
+    mp3Position = new_position;
+    soundEnd = 0;
+
+    // Reinitialize decoder
+    if (mp3Mad) {
+        mad_uninit(mp3Mad);
+        mp3Mad = mad_init();
+    }
+
+    log_cb(RETRO_LOG_INFO, "[froggymp3] Seek to position %u\n", mp3Position);
+}
+
+static void fallback_log(enum retro_log_level level, const char *fmt, ...) {
+    va_list va;
+    va_start(va, fmt);
+    vfprintf(stderr, fmt, va);
+    va_end(va);
 }
 
 static void update_variables(void) { }
 
-void retro_init(void)
-{
-   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_init() called\n");
-   update_variables();
+void retro_init(void) {
+    log_cb(RETRO_LOG_INFO, "[froggymp3] retro_init()\n");
+    update_variables();
 
-   log_cb(RETRO_LOG_INFO, "[froggymp3] allocating soundBuffer...\n");
-   soundBuffer = (s16 *)malloc(32768);
-   log_cb(RETRO_LOG_INFO, "[froggymp3] soundBuffer=%p\n", soundBuffer);
+    soundBuffer = (s16 *)malloc(32768);
+    width = SCREEN_WIDTH;
+    height = SCREEN_HEIGHT;
 
-   width       = 320;
-   height      = 240;
+    // Initialize font system
+    font_init();
 
-   log_cb(RETRO_LOG_INFO, "[froggymp3] initializing pixels...\n");
-   for (int i = 0; i < 320 * 240; i++) {
-      pixels[i] = 0x001F;
-   }
-   // Don't call video_cb here - it's not set up yet!
-   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_init() complete\n");
+    // Initialize browser
+    scan_directory();
+
+    log_cb(RETRO_LOG_INFO, "[froggymp3] retro_init() complete\n");
 }
 
-void retro_deinit(void)
-{
-   if (soundBuffer)
-      free(soundBuffer);
-   soundBuffer = NULL;
+void retro_deinit(void) {
+    unload_mp3();
+    if (soundBuffer) {
+        free(soundBuffer);
+        soundBuffer = NULL;
+    }
 }
 
-unsigned retro_api_version(void)
-{
+unsigned retro_api_version(void) {
     return RETRO_API_VERSION;
 }
 
-void retro_set_controller_port_device(unsigned port, unsigned device)
-{
+void retro_set_controller_port_device(unsigned port, unsigned device) {
     (void)port;
     (void)device;
 }
 
-void retro_get_system_info(struct retro_system_info *info)  //Core config information
-{
-   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_get_system_info() called\n");
-   memset(info, 0, sizeof(*info));
-   info->library_name     = "froggyMP3";
-   info->need_fullpath    = false;
-   info->valid_extensions = "mp3";
+void retro_get_system_info(struct retro_system_info *info) {
+    memset(info, 0, sizeof(*info));
+    info->library_name     = "froggyMP3";
+    info->need_fullpath    = false;
+    info->valid_extensions = "mp3";
 #ifdef GIT_VERSION
-   info->library_version  = "git" GIT_VERSION;
+    info->library_version  = "git" GIT_VERSION;
 #else
-   info->library_version  = "svn";
+    info->library_version  = "1.0";
 #endif
-   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_get_system_info() complete\n");
 }
 
-void retro_get_system_av_info(struct retro_system_av_info *info)  //Video information
-{
-    log_cb(RETRO_LOG_INFO, "[froggymp3] retro_get_system_av_info() called, mp3SampleRate=%u\n", mp3SampleRate);
+void retro_get_system_av_info(struct retro_system_av_info *info) {
     info->timing.fps            = FPS;
     info->timing.sample_rate    = (double)mp3SampleRate;
-
-    info->geometry.base_width   = 320;
-    info->geometry.base_height  = 240;
-
-    info->geometry.max_width    = 320;
-    info->geometry.max_height   = 240;
-    info->geometry.aspect_ratio = 4/3;
-    log_cb(RETRO_LOG_INFO, "[froggymp3] retro_get_system_av_info() complete\n");
+    info->geometry.base_width   = SCREEN_WIDTH;
+    info->geometry.base_height  = SCREEN_HEIGHT;
+    info->geometry.max_width    = SCREEN_WIDTH;
+    info->geometry.max_height   = SCREEN_HEIGHT;
+    info->geometry.aspect_ratio = 4.0f/3.0f;
 }
 
-void retro_set_environment(retro_environment_t cb) //Input configs
-{
-   struct retro_vfs_interface_info vfs_iface_info;
-   struct retro_log_callback logging;
-   static const struct retro_controller_description port[] = {
-      {"RetroPad",      RETRO_DEVICE_JOYPAD     },
-      {"RetroKeyboard", RETRO_DEVICE_KEYBOARD   },
-   };
+void retro_set_environment(retro_environment_t cb) {
+    struct retro_vfs_interface_info vfs_iface_info;
+    struct retro_log_callback logging;
+    static const struct retro_controller_description port[] = {
+        {"RetroPad", RETRO_DEVICE_JOYPAD},
+    };
+    static const struct retro_controller_info ports[] = {
+        {port, 1},
+        {NULL, 0},
+    };
 
-   static const struct retro_controller_info ports[] = {
-      {port, 2},
-      {port, 2},
-      {NULL, 0},
-   };
+    environ_cb = cb;
 
-   environ_cb = cb;
+    if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging))
+        log_cb = logging.log;
 
-   if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging))
-      log_cb = logging.log;
+    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void *)ports);
 
-   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_set_environment() called\n");
-
-   cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void *)ports);
-
-   vfs_iface_info.required_interface_version = 2;
-   vfs_iface_info.iface                      = NULL;
-   if (cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_iface_info))
-	   filestream_vfs_init(&vfs_iface_info);
-   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_set_environment() complete\n");
+    vfs_iface_info.required_interface_version = 2;
+    vfs_iface_info.iface = NULL;
+    if (cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_iface_info))
+        filestream_vfs_init(&vfs_iface_info);
 }
 
-void retro_set_audio_sample(retro_audio_sample_t cb)
-{
-    audio_cb = cb;
-}
+void retro_set_audio_sample(retro_audio_sample_t cb) { audio_cb = cb; }
+void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audio_batch_cb = cb; }
+void retro_set_input_poll(retro_input_poll_t cb) { input_poll_cb = cb; }
+void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
+void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
+void retro_reset(void) { }
 
-void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb)
-{
-    audio_batch_cb = cb;
-}
-
-void retro_set_input_poll(retro_input_poll_t cb)
-{
-    input_poll_cb = cb;
-}
-
-void retro_set_input_state(retro_input_state_t cb)
-{
-    input_state_cb = cb;
-}
-
-void retro_set_video_refresh(retro_video_refresh_t cb)
-{
-    video_cb = cb;
-}
-
-void retro_reset(void)
-{
-}
-
-struct KeyMap
-{
-   unsigned port;
-   unsigned index;
-
-   int scanCode;
-} keymap[] = {
-    {0, RETRO_DEVICE_ID_JOYPAD_A,      0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_B,      0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_UP,     0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_RIGHT,  0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_LEFT,   0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_DOWN,   0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_X,      0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_Y,      0     },                                                                                                                                                        // 7
-    {0, RETRO_DEVICE_ID_JOYPAD_L,      0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_R,      0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_SELECT, 0     },
-    {0, RETRO_DEVICE_ID_JOYPAD_START,  0     },                                                                                                                                                        // 11
-
-    {1, RETRO_DEVICE_ID_JOYPAD_A,      0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_B,      0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_UP,     0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_RIGHT,  0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_LEFT,   0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_DOWN,   0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_X,      0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_Y,      0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_L,      0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_R,      0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_SELECT, 0     },
-    {1, RETRO_DEVICE_ID_JOYPAD_START,  0     }
-};
-
-// Calculate samples needed per frame based on sample rate
+// Calculate samples needed per frame
 #define NEEDFRAME_FOR_RATE(rate) ((rate) / FPS)
 #define NEEDBYTE_FOR_RATE(rate)  (NEEDFRAME_FOR_RATE(rate) * 4)
 
-void retro_run(void) //Called every frame
-{
-   int i;
-   static char keyPressed[24] = {0};
-   static bool updated        = false;
+void retro_run(void) {
+    static bool updated = false;
 
-   // Calculate frame sizes based on actual sample rate
-   u32 needFrame = NEEDFRAME_FOR_RATE(mp3SampleRate);
-   u32 needByte = NEEDBYTE_FOR_RATE(mp3SampleRate);
+    u32 needFrame = NEEDFRAME_FOR_RATE(mp3SampleRate);
+    u32 needByte = NEEDBYTE_FOR_RATE(mp3SampleRate);
 
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE,&updated) && updated) //update variables if needed
-      update_variables();
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+        update_variables();
 
-   input_poll_cb();                             //take inputs
+    input_poll_cb();
 
-   for (i = 0; i < 24; i++)                     //Check which inputs were pressed
-   {
-      if (input_state_cb(keymap[i].port, RETRO_DEVICE_JOYPAD, 0,
-               keymap[i].index))
-      {
-         if (keyPressed[i] == 0)
-         {
-            keyPressed[i] = 1;
+    // Track button states
+    int buttons[] = {
+        RETRO_DEVICE_ID_JOYPAD_A,
+        RETRO_DEVICE_ID_JOYPAD_B,
+        RETRO_DEVICE_ID_JOYPAD_UP,
+        RETRO_DEVICE_ID_JOYPAD_DOWN,
+        RETRO_DEVICE_ID_JOYPAD_LEFT,
+        RETRO_DEVICE_ID_JOYPAD_RIGHT,
+        RETRO_DEVICE_ID_JOYPAD_START,
+        RETRO_DEVICE_ID_JOYPAD_SELECT,
+        RETRO_DEVICE_ID_JOYPAD_L,
+        RETRO_DEVICE_ID_JOYPAD_R
+    };
 
-            if (keymap[i].index == RETRO_DEVICE_ID_JOYPAD_R)
-               environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+    for (int i = 0; i < 10; i++) {
+        int pressed = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, buttons[i]);
+        key_just_pressed[i] = (pressed && !key_pressed[i]);
+        key_pressed[i] = pressed;
+    }
 
-            if (keymap[i].index == RETRO_DEVICE_ID_JOYPAD_SELECT)
-               kpause = !kpause;
-
-         }
-      }
-      else
-      {
-         if (keyPressed[i] == 1)
-            keyPressed[i] = 0;
-      }
-
-   }
-
-   video_cb(pixels, width, height, width); //draw main framebuffer
-
-   // Play mp3 (to clean)
-   if (!kpause)   //if not paused
-   {
-
-      int error = 0;
-
-      while (soundEnd <= needByte)  //we need more sound data
-      {
-         int length = 2048;
-         int read;
-         int retour;
-         int done; // en bytes
-         int resolution = 16;
-         int halfsamplerate = 0;
-
-         if (mp3Position + length > mp3Length)                             //if the currentPosition + next audio segment > mp3 data length
-         {
-            length = mp3Length - mp3Position;
-            if (length <= 128) // 2048 / 16        less than 128 chars left from mp3 data -> exit
-            {
-               log_cb(RETRO_LOG_INFO,"Song ended, exiting libretro\n");
-               environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-               break;
+    // Handle input based on current state
+    if (app_state == STATE_BROWSER) {
+        // UP - move selection up
+        if (key_just_pressed[2] && selected_index > 0) {
+            selected_index--;
+            if (selected_index < scroll_offset) {
+                scroll_offset = selected_index;
             }
-         }
+            ui_dirty = 1;
+        }
 
-         retour = mad_decode(mp3Mad, mp3 + mp3Position, length,
-               (char *)soundBuffer + soundEnd, 10000, &read,
-               &done, resolution, halfsamplerate);                         //decode current audio segment with mp3Mad
+        // DOWN - move selection down
+        if (key_just_pressed[3] && selected_index < file_count - 1) {
+            selected_index++;
+            if (selected_index >= scroll_offset + VISIBLE_ITEMS) {
+                scroll_offset = selected_index - VISIBLE_ITEMS + 1;
+            }
+            ui_dirty = 1;
+        }
 
-         soundEnd += done;                                                 //increment already played audio segment
+        // A or START - select item
+        if ((key_just_pressed[0] || key_just_pressed[6]) && file_count > 0) {
+            FileEntry *entry = &file_list[selected_index];
+            if (entry->is_dir) {
+                enter_directory(entry->name);
+                ui_dirty = 1;
+            } else {
+                // Load and play MP3
+                char full_path[MAX_PATH_LEN];
+                snprintf(full_path, MAX_PATH_LEN, "%s/%s", current_path, entry->name);
+                if (load_mp3_file(full_path)) {
+                    strncpy(current_song, entry->name, MAX_NAME_LEN - 1);
+                    current_song[MAX_NAME_LEN - 1] = '\0';
+                    init_scrolling_title();
+                    app_state = STATE_PLAYING;
+                    ui_dirty = 1;
+                }
+            }
+        }
 
-         if (done == 0)    //error
-         {
-#if !defined(SF2000)
-            log_cb(RETRO_LOG_ERROR,
-                  "mad decode (Err:%d) %d (%d, %d) %d\n",
-                  retour, mp3Position, read, done, soundEnd);
-#endif
-            read++; /* Skip in case of error. */
-            error++;
-            if (error > 65536)
-               break;
-         }
+        // B - go back / parent directory
+        if (key_just_pressed[1]) {
+            go_parent_directory();
+            ui_dirty = 1;
+        }
 
-         mp3Position += read;                                              //update mp3 position with read chars(bytes)
-      }
+        if (ui_dirty) {
+            render_browser();
+            ui_dirty = 0;
+        }
+    }
+    else if (app_state == STATE_PLAYING) {
+        // A - toggle play/pause
+        if (key_just_pressed[0]) {
+            kpause = !kpause;
+            ui_dirty = 1;
+        }
 
-      if (RETRO_IS_BIG_ENDIAN)
-      {
-         int i;
-         for (i = 0; i < needFrame * 2; i++)
-            soundBuffer[i] = SWAP16(soundBuffer[i]);
-      }
+        // L - rewind 5 seconds
+        if (key_just_pressed[8]) {
+            seek_mp3(-5);
+            ui_dirty = 1;
+        }
 
-      audio_batch_cb(soundBuffer, needFrame);                             //play sound callback
+        // R - forward 5 seconds
+        if (key_just_pressed[9]) {
+            seek_mp3(5);
+            ui_dirty = 1;
+        }
 
-      soundEnd -= needByte;                                               //played current audio bytes -> empty soundEnd(which holds the audio bytes size left to be played)?
+        // LEFT - rewind 5 seconds
+        if (key_just_pressed[4]) {
+            seek_mp3(-5);
+            ui_dirty = 1;
+        }
 
-      memcpy( (char *)soundBuffer,
-              (char *)soundBuffer + needByte, soundEnd);                   //remove played audio segment from soundbuffer?
-   }
+        // RIGHT - forward 5 seconds
+        if (key_just_pressed[5]) {
+            seek_mp3(5);
+            ui_dirty = 1;
+        }
+
+        // SELECT - return to browser (keep playing)
+        if (key_just_pressed[7]) {
+            app_state = STATE_BROWSER;
+            ui_dirty = 1;
+        }
+
+        // START - stop and return to browser
+        if (key_just_pressed[6]) {
+            unload_mp3();
+            current_song[0] = '\0';
+            app_state = STATE_BROWSER;
+            ui_dirty = 1;
+        }
+
+        // Update scrolling title animation
+        if (title_needs_scroll) {
+            if (title_scroll_delay > 0) {
+                title_scroll_delay--;
+                if (title_scroll_delay == 0 && title_needs_scroll == 2) {
+                    // Reset to beginning after pause at end
+                    title_scroll_offset = 0;
+                    title_scroll_delay = SCROLL_DELAY_FRAMES;
+                    title_needs_scroll = 1;
+                    ui_dirty = 1;
+                }
+            } else {
+                int title_width = font_measure_text(scrolling_title);
+                int max_scroll = title_width - TITLE_MAX_WIDTH;
+
+                title_scroll_offset += SCROLL_SPEED;
+
+                if (title_scroll_offset >= max_scroll) {
+                    // Reached end, pause then reset
+                    title_scroll_offset = max_scroll;
+                    title_scroll_delay = SCROLL_DELAY_FRAMES;
+                    title_needs_scroll = 2; // Flag to reset after delay
+                }
+                ui_dirty = 1;
+            }
+        }
+
+        if (ui_dirty) {
+            render_player();
+            ui_dirty = 0;
+        }
+
+        // Play audio if not paused and file loaded
+        if (!kpause && mp3Mad && mp3) {
+            int error = 0;
+
+            while (soundEnd <= needByte) {
+                int length = 2048;
+                int read;
+                int retour;
+                int done;
+                int resolution = 16;
+                int halfsamplerate = 0;
+
+                if (mp3Position + length > mp3Length) {
+                    length = mp3Length - mp3Position;
+                    if (length <= 128) {
+                        // Song ended - return to browser
+                        log_cb(RETRO_LOG_INFO, "[froggymp3] Song ended\n");
+                        unload_mp3();
+                        current_song[0] = '\0';
+                        app_state = STATE_BROWSER;
+                        ui_dirty = 1;
+                        break;
+                    }
+                }
+
+                retour = mad_decode(mp3Mad, mp3 + mp3Position, length,
+                      (char *)soundBuffer + soundEnd, 10000, &read,
+                      &done, resolution, halfsamplerate);
+
+                soundEnd += done;
+
+                if (done == 0) {
+                    read++;
+                    error++;
+                    if (error > 65536) break;
+                }
+
+                mp3Position += read;
+            }
+
+            if (RETRO_IS_BIG_ENDIAN) {
+                for (int i = 0; i < (int)(needFrame * 2); i++)
+                    soundBuffer[i] = SWAP16(soundBuffer[i]);
+            }
+
+            audio_batch_cb(soundBuffer, needFrame);
+            soundEnd -= needByte;
+            memcpy((char *)soundBuffer, (char *)soundBuffer + needByte, soundEnd);
+        }
+    }
+
+    video_cb(pixels, width, height, width * sizeof(uint16_t));
 }
 
-bool retro_load_game(const struct retro_game_info *info)
-{
-   size_t openMP3Filename_len;
-   char openCDGFilename[1024];
-   char openMP3Filename[1024];
-   struct retro_input_descriptor desc[] = {
-      {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,   "Left"  },
-      {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,     "Up"    },
-      {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,   "Down"  },
-      {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT,  "Right" },
-      {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,  "Start" },
-      {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Pause" },
-      {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R, "Shutdown" },
-      {0},
-   };
-   enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
+bool retro_load_game(const struct retro_game_info *info) {
+    struct retro_input_descriptor desc[] = {
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,   "Left / Rewind"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,     "Up"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,   "Down"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT,  "Right / Forward"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,      "Select / Play/Pause"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,      "Back"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,  "Play / Stop"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Browser"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,      "Rewind 5s"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,      "Forward 5s"},
+        {0},
+    };
+    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
 
-   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_load_game() called\n");
-   log_cb(RETRO_LOG_INFO, "[froggymp3] info=%p, info->path=%s\n", info, info ? info->path : "NULL");
+    log_cb(RETRO_LOG_INFO, "[froggymp3] retro_load_game()\n");
 
-   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
-   log_cb(RETRO_LOG_INFO, "[froggymp3] input descriptors set\n");
+    environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
 
-   // Init pixel format
-   if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
-   {
-      log_cb(RETRO_LOG_INFO, "XRGG565 is not supported.\n");
-      return 0;
-   }
-   log_cb(RETRO_LOG_INFO, "[froggymp3] pixel format set\n");
+    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) {
+        log_cb(RETRO_LOG_ERROR, "RGB565 not supported\n");
+        return false;
+    }
 
-   //load .mp3
-   strcpy(openMP3Filename, info->path);
-   openMP3Filename_len = strlen(openMP3Filename);
-   log_cb(RETRO_LOG_INFO, "[froggymp3] calling retro_load_game_internal with: %s\n", openMP3Filename);
+    // If a specific file was passed, try to load it directly
+    if (info && info->path) {
+        log_cb(RETRO_LOG_INFO, "[froggymp3] Loading file: %s\n", info->path);
 
-   return retro_load_game_internal(openMP3Filename); //TODO delete CDG
+        // Extract directory from path
+        char *last_slash = strrchr(info->path, '/');
+        if (last_slash) {
+            int dir_len = last_slash - info->path;
+            if (dir_len < MAX_PATH_LEN) {
+                strncpy(current_path, info->path, dir_len);
+                current_path[dir_len] = '\0';
+            }
+
+            // Load the MP3
+            if (load_mp3_file(info->path)) {
+                strncpy(current_song, last_slash + 1, MAX_NAME_LEN - 1);
+                current_song[MAX_NAME_LEN - 1] = '\0';
+                init_scrolling_title();
+                app_state = STATE_PLAYING;
+            }
+        }
+
+        // Scan the directory anyway
+        scan_directory();
+    }
+
+    return true;
 }
 
-void retro_unload_game(void)
-{
+void retro_unload_game(void) {
     CDGUnload();
-    if (mp3)
-       free(mp3);
-    if (mp3Mad)
-       mad_uninit(mp3Mad);
-    mp3 = NULL;
+    unload_mp3();
 }
 
-unsigned retro_get_region(void)
-{
-    return RETRO_REGION_PAL;
-}
-
-bool retro_load_game_special(unsigned type, const struct retro_game_info *info, size_t num)
-{
-    (void)type;
-    (void)info;
-    (void)num;
-    return false;
-}
-
-size_t retro_serialize_size(void)
-{
-    return 0;
-}
-
-bool retro_serialize(void *data_, size_t size)
-{
-    return false;
-}
-
-bool retro_unserialize(const void *data_, size_t size)
-{
-    return false;
-}
-
-void * retro_get_memory_data(unsigned id)
-{
-    return NULL;
-}
-
-size_t retro_get_memory_size(unsigned id)
-{
-    return 0;
-}
-
-void retro_cheat_reset(void)
-{
-}
-
-void retro_cheat_set(unsigned index, bool enabled, const char *code)
-{
-    (void)index;
-    (void)enabled;
-    (void)code;
-}
+unsigned retro_get_region(void) { return RETRO_REGION_PAL; }
+bool retro_load_game_special(unsigned type, const struct retro_game_info *info, size_t num) { return false; }
+size_t retro_serialize_size(void) { return 0; }
+bool retro_serialize(void *data_, size_t size) { return false; }
+bool retro_unserialize(const void *data_, size_t size) { return false; }
+void *retro_get_memory_data(unsigned id) { return NULL; }
+size_t retro_get_memory_size(unsigned id) { return 0; }
+void retro_cheat_reset(void) { }
+void retro_cheat_set(unsigned index, bool enabled, const char *code) { }
