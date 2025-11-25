@@ -340,3 +340,21 @@ void mad_seteq(void* hMad, equalizer_value* eq)
 		dec->eqfactor[i] = eq_factor(base + eq_decibels(eq->data[map[i]]));
 	dec->equalizer = eq->enable;
 }
+
+int mad_get_samplerate(void* hMad)
+{
+	dec_struct* dec = (dec_struct*)hMad;
+	return dec->frame.header.samplerate;
+}
+
+int mad_get_bitrate(void* hMad)
+{
+	dec_struct* dec = (dec_struct*)hMad;
+	return dec->frame.header.bitrate;
+}
+
+int mad_get_channels(void* hMad)
+{
+	dec_struct* dec = (dec_struct*)hMad;
+	return MAD_NCHANNELS(&dec->frame.header);
+}

@@ -27,11 +27,16 @@ static void *mp3Mad     = NULL;  //mp3Mad instance
 static char *mp3        = NULL;  //mp3 file data
 static u32 mp3Length    = 0;     //length of mp3 file data
 static u32 mp3Position  = 0;     //current position in reading mp3 file data
+static u32 mp3StartPosition = 0; //position after ID3 tag (for restarting decode)
 
 static s16 *soundBuffer = NULL;
 static u16 soundEnd     = 0;
 
 static u8 kpause        = 0;     //is core paused
+
+static u32 mp3SampleRate = 44100; //sample rate from MP3 file (default 44100)
+static u32 mp3Bitrate    = 0;     //bitrate from MP3 file
+static u32 mp3Channels   = 2;     //channels from MP3 file
 
 u16 pixels[320 * 240];       //framebuffer 1 (main fb for karakoke text)
 
@@ -84,41 +89,114 @@ static u16 AlphaBlend(u16 pixel, u16 backpixel, u16 opacity)
 static bool retro_load_game_internal(const char *mp3_filename)
 {
    FILE *fic = NULL;
+   log_cb(RETRO_LOG_INFO, "[froggymp3] load_game_internal: opening %s\n", mp3_filename);
+
    fic = fopen(mp3_filename, "rb");          //open file (for reading in binary mode)
-   if (!fic)
+   if (!fic) {
+      log_cb(RETRO_LOG_ERROR, "[froggymp3] failed to open file\n");
       return false;
+   }
+   log_cb(RETRO_LOG_INFO, "[froggymp3] file opened successfully\n");
+
    fseek(fic, 0, SEEK_END);                  //get where the file ends
    mp3Length = ftell(fic);                   //save mp3 file length
+   log_cb(RETRO_LOG_INFO, "[froggymp3] file length: %u\n", mp3Length);
+
    fseek(fic, 0, SEEK_SET);                  //back to mp3 file beginning
-   if (!(mp3 = (char *)malloc(mp3Length)))   //allocate mp3 file size amount of memory (true if succes, false if not)
+   if (!(mp3 = (char *)malloc(mp3Length))) {  //allocate mp3 file size amount of memory
+      log_cb(RETRO_LOG_ERROR, "[froggymp3] failed to allocate %u bytes\n", mp3Length);
+      fclose(fic);
       return false;
+   }
+   log_cb(RETRO_LOG_INFO, "[froggymp3] allocated %u bytes at %p\n", mp3Length, mp3);
+
    fread(mp3, 1, mp3Length, fic);            //read file data into variable
    fclose(fic);                              //close file
+   log_cb(RETRO_LOG_INFO, "[froggymp3] file read complete\n");
 
    mp3Position = 0;
 
    if (mp3Length > 10) /* Skip ID3 Tag */
    {
       id3Header header;
-   memcpy(&header, mp3, 10);
+      memcpy(&header, mp3, 10);
 
       if ((header.identifier[0] == 0x49) && (header.identifier[1] == 0x44) && (header.identifier[2] == 0x33))
       {
-
          mp3Position = (header.lengthSyncSafe[0] & 0x7f);
          mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[1] & 0x7f);
          mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[2] & 0x7f);
          mp3Position = (mp3Position << 7) | (header.lengthSyncSafe[3] & 0x7f);
 
-         log_cb(RETRO_LOG_INFO, "id3 length: %d\n", mp3Position);
+         log_cb(RETRO_LOG_INFO, "[froggymp3] id3 tag length: %u\n", mp3Position);
 
          mp3Position = mp3Position + 10;
       }
    }
+   log_cb(RETRO_LOG_INFO, "[froggymp3] mp3 data starts at position: %u\n", mp3Position);
 
-   mp3Mad   = mad_init();                    //init libmad for mp3 decoding
+   mp3StartPosition = mp3Position;           //save start position for later use
+   log_cb(RETRO_LOG_INFO, "[froggymp3] calling mad_init()\n");
+   mp3Mad = mad_init();                      //init libmad for mp3 decoding
+   if (!mp3Mad) {
+      log_cb(RETRO_LOG_ERROR, "[froggymp3] mad_init() failed!\n");
+      return false;
+   }
+   log_cb(RETRO_LOG_INFO, "[froggymp3] mad_init() returned %p\n", mp3Mad);
    soundEnd = 0;
 
+   // Decode first frame to get sample rate, bitrate, and channels
+   log_cb(RETRO_LOG_INFO, "[froggymp3] decoding first frame for metadata...\n");
+   {
+      int read = 0, done = 0;
+      int length = (mp3Length - mp3Position > 4096) ? 4096 : (mp3Length - mp3Position);
+      log_cb(RETRO_LOG_INFO, "[froggymp3] probe length: %d\n", length);
+
+      char *tempBuffer = (char *)malloc(32768);
+      log_cb(RETRO_LOG_INFO, "[froggymp3] tempBuffer allocated at %p\n", tempBuffer);
+
+      if (tempBuffer) {
+         log_cb(RETRO_LOG_INFO, "[froggymp3] calling mad_decode() for probe...\n");
+         int retour = mad_decode(mp3Mad, mp3 + mp3Position, length,
+                                 tempBuffer, 32768, &read, &done, 16, 0);
+         log_cb(RETRO_LOG_INFO, "[froggymp3] mad_decode returned %d, read=%d, done=%d\n", retour, read, done);
+
+         if (retour == MAD_OK || done > 0) {
+            log_cb(RETRO_LOG_INFO, "[froggymp3] getting sample rate...\n");
+            mp3SampleRate = mad_get_samplerate(mp3Mad);
+            log_cb(RETRO_LOG_INFO, "[froggymp3] samplerate=%u\n", mp3SampleRate);
+
+            log_cb(RETRO_LOG_INFO, "[froggymp3] getting bitrate...\n");
+            mp3Bitrate = mad_get_bitrate(mp3Mad);
+            log_cb(RETRO_LOG_INFO, "[froggymp3] bitrate=%u\n", mp3Bitrate);
+
+            log_cb(RETRO_LOG_INFO, "[froggymp3] getting channels...\n");
+            mp3Channels = mad_get_channels(mp3Mad);
+            log_cb(RETRO_LOG_INFO, "[froggymp3] channels=%u\n", mp3Channels);
+
+            log_cb(RETRO_LOG_INFO, "[froggymp3] MP3 info: samplerate=%u, bitrate=%u, channels=%u\n",
+                   mp3SampleRate, mp3Bitrate, mp3Channels);
+         } else {
+            log_cb(RETRO_LOG_WARN, "[froggymp3] probe decode failed, using defaults\n");
+         }
+
+         log_cb(RETRO_LOG_INFO, "[froggymp3] freeing tempBuffer\n");
+         free(tempBuffer);
+
+         // Reset decoder for clean playback
+         log_cb(RETRO_LOG_INFO, "[froggymp3] resetting decoder...\n");
+         mad_uninit(mp3Mad);
+         log_cb(RETRO_LOG_INFO, "[froggymp3] mad_uninit done, calling mad_init again...\n");
+         mp3Mad = mad_init();
+         log_cb(RETRO_LOG_INFO, "[froggymp3] new mp3Mad=%p\n", mp3Mad);
+         mp3Position = mp3StartPosition;
+         log_cb(RETRO_LOG_INFO, "[froggymp3] reset mp3Position to %u\n", mp3Position);
+      } else {
+         log_cb(RETRO_LOG_WARN, "[froggymp3] failed to allocate tempBuffer, using defaults\n");
+      }
+   }
+
+   log_cb(RETRO_LOG_INFO, "[froggymp3] load_game_internal complete, returning true\n");
    return true;
 }
 
@@ -134,17 +212,22 @@ static void update_variables(void) { }
 
 void retro_init(void)
 {
+   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_init() called\n");
    update_variables();
 
+   log_cb(RETRO_LOG_INFO, "[froggymp3] allocating soundBuffer...\n");
    soundBuffer = (s16 *)malloc(32768);
+   log_cb(RETRO_LOG_INFO, "[froggymp3] soundBuffer=%p\n", soundBuffer);
 
    width       = 320;
    height      = 240;
 
+   log_cb(RETRO_LOG_INFO, "[froggymp3] initializing pixels...\n");
    for (int i = 0; i < 320 * 240; i++) {
       pixels[i] = 0x001F;
    }
-   video_cb(pixels, width, height, width);
+   // Don't call video_cb here - it's not set up yet!
+   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_init() complete\n");
 }
 
 void retro_deinit(void)
@@ -167,6 +250,7 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
 
 void retro_get_system_info(struct retro_system_info *info)  //Core config information
 {
+   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_get_system_info() called\n");
    memset(info, 0, sizeof(*info));
    info->library_name     = "froggyMP3";
    info->need_fullpath    = false;
@@ -176,12 +260,14 @@ void retro_get_system_info(struct retro_system_info *info)  //Core config inform
 #else
    info->library_version  = "svn";
 #endif
+   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_get_system_info() complete\n");
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)  //Video information
 {
+    log_cb(RETRO_LOG_INFO, "[froggymp3] retro_get_system_av_info() called, mp3SampleRate=%u\n", mp3SampleRate);
     info->timing.fps            = FPS;
-    info->timing.sample_rate    = 44100.0;
+    info->timing.sample_rate    = (double)mp3SampleRate;
 
     info->geometry.base_width   = 320;
     info->geometry.base_height  = 240;
@@ -189,6 +275,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)  //Video inform
     info->geometry.max_width    = 320;
     info->geometry.max_height   = 240;
     info->geometry.aspect_ratio = 4/3;
+    log_cb(RETRO_LOG_INFO, "[froggymp3] retro_get_system_av_info() complete\n");
 }
 
 void retro_set_environment(retro_environment_t cb) //Input configs
@@ -211,12 +298,15 @@ void retro_set_environment(retro_environment_t cb) //Input configs
    if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging))
       log_cb = logging.log;
 
+   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_set_environment() called\n");
+
    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void *)ports);
 
    vfs_iface_info.required_interface_version = 2;
    vfs_iface_info.iface                      = NULL;
    if (cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_iface_info))
 	   filestream_vfs_init(&vfs_iface_info);
+   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_set_environment() complete\n");
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb)
@@ -282,14 +372,19 @@ struct KeyMap
     {1, RETRO_DEVICE_ID_JOYPAD_START,  0     }
 };
 
-#define NEEDFRAME (44100 / 50) // 32768 max
-#define NEEDBYTE  (NEEDFRAME * 4) // 32768 max
+// Calculate samples needed per frame based on sample rate
+#define NEEDFRAME_FOR_RATE(rate) ((rate) / FPS)
+#define NEEDBYTE_FOR_RATE(rate)  (NEEDFRAME_FOR_RATE(rate) * 4)
 
 void retro_run(void) //Called every frame
 {
    int i;
    static char keyPressed[24] = {0};
    static bool updated        = false;
+
+   // Calculate frame sizes based on actual sample rate
+   u32 needFrame = NEEDFRAME_FOR_RATE(mp3SampleRate);
+   u32 needByte = NEEDBYTE_FOR_RATE(mp3SampleRate);
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE,&updated) && updated) //update variables if needed
       update_variables();
@@ -329,7 +424,7 @@ void retro_run(void) //Called every frame
 
       int error = 0;
 
-      while (soundEnd <= NEEDBYTE)  //soundEnd <= ((44100 / 50) * 4) we need more sound data
+      while (soundEnd <= needByte)  //we need more sound data
       {
          int length = 2048;
          int read;
@@ -374,16 +469,16 @@ void retro_run(void) //Called every frame
       if (RETRO_IS_BIG_ENDIAN)
       {
          int i;
-         for (i = 0; i < NEEDFRAME * 2; i++)
+         for (i = 0; i < needFrame * 2; i++)
             soundBuffer[i] = SWAP16(soundBuffer[i]);
       }
 
-      audio_batch_cb(soundBuffer, NEEDFRAME);                             //play sound callback
+      audio_batch_cb(soundBuffer, needFrame);                             //play sound callback
 
-      soundEnd -= NEEDBYTE;                                               //played current audio bytes -> empty soundEnd(which holds the audio bytes size left to be played)?
+      soundEnd -= needByte;                                               //played current audio bytes -> empty soundEnd(which holds the audio bytes size left to be played)?
 
       memcpy( (char *)soundBuffer,
-              (char *)soundBuffer + NEEDBYTE, soundEnd);                   //remove played audio segment from soundbuffer?
+              (char *)soundBuffer + needByte, soundEnd);                   //remove played audio segment from soundbuffer?
    }
 }
 
@@ -404,9 +499,11 @@ bool retro_load_game(const struct retro_game_info *info)
    };
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
 
-   log_cb(RETRO_LOG_INFO, "begin of load games\n");
+   log_cb(RETRO_LOG_INFO, "[froggymp3] retro_load_game() called\n");
+   log_cb(RETRO_LOG_INFO, "[froggymp3] info=%p, info->path=%s\n", info, info ? info->path : "NULL");
 
    environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
+   log_cb(RETRO_LOG_INFO, "[froggymp3] input descriptors set\n");
 
    // Init pixel format
    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
@@ -414,10 +511,12 @@ bool retro_load_game(const struct retro_game_info *info)
       log_cb(RETRO_LOG_INFO, "XRGG565 is not supported.\n");
       return 0;
    }
+   log_cb(RETRO_LOG_INFO, "[froggymp3] pixel format set\n");
 
    //load .mp3
    strcpy(openMP3Filename, info->path);
    openMP3Filename_len = strlen(openMP3Filename);
+   log_cb(RETRO_LOG_INFO, "[froggymp3] calling retro_load_game_internal with: %s\n", openMP3Filename);
 
    return retro_load_game_internal(openMP3Filename); //TODO delete CDG
 }

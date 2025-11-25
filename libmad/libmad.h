@@ -51,6 +51,9 @@ LIBMAD_EXPORT int mad_decode(void* hMad, char *inmemory,int inmemsize, char *out
 							 int outmemsize, int* read, int *done, int resolution, int halfsamplerate);
 LIBMAD_EXPORT void mad_uninit(void* hMad);
 LIBMAD_EXPORT void mad_seteq(void* hMad, equalizer_value* eq);
+LIBMAD_EXPORT int mad_get_samplerate(void* hMad);
+LIBMAD_EXPORT int mad_get_bitrate(void* hMad);
+LIBMAD_EXPORT int mad_get_channels(void* hMad);
 
 #ifdef __cplusplus
 }
