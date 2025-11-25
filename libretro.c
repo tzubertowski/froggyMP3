@@ -265,57 +265,57 @@ void retro_run(void)
         /* always redraw player - progress bar updates continuously */
         player_draw();
         ui_dirty = 0;
+    }
 
-        /* continue background loading */
-        player_bg_load();
+    /* continue background loading (runs in any state) */
+    player_bg_load();
 
-        /* audio decode */
-        if (!player_paused && player_mad && player_len > 0) {
-            int err = 0;
+    /* audio decode (runs in any state if playing) */
+    if (!player_paused && player_mad && player_len > 0) {
+        int err = 0;
 
-            while (player_pcm_fill <= need_bytes) {
-                int len = 2048;
-                int rd, done;
-                char *data;
+        while (player_pcm_fill <= need_bytes) {
+            int len = 2048;
+            int rd, done;
+            char *data;
 
-                if (player_pos + len > player_len) {
-                    len = player_len - player_pos;
-                    if (len <= 128) {
-                        player_on_end();
-                        break;
-                    }
-                }
-
-                data = player_get_data(player_pos, len);
-                if (!data) {
-                    /* data not loaded yet, wait */
+            if (player_pos + len > player_len) {
+                len = player_len - player_pos;
+                if (len <= 128) {
+                    player_on_end();
                     break;
                 }
-
-                mad_decode(player_mad, data, len,
-                           (char *)player_pcm + player_pcm_fill, 10000,
-                           &rd, &done, 16, 0);
-
-                player_pcm_fill += done;
-
-                if (done == 0) {
-                    rd++;
-                    err++;
-                    if (err > 65536) break;
-                }
-
-                player_pos += rd;
             }
 
-            if (RETRO_IS_BIG_ENDIAN) {
-                for (i = 0; i < (int)(need_samples * 2); i++)
-                    player_pcm[i] = SWAP16(player_pcm[i]);
+            data = player_get_data(player_pos, len);
+            if (!data) {
+                /* data not loaded yet, wait */
+                break;
             }
 
-            audio_batch_cb(player_pcm, need_samples);
-            player_pcm_fill -= need_bytes;
-            memmove(player_pcm, (char *)player_pcm + need_bytes, player_pcm_fill);
+            mad_decode(player_mad, data, len,
+                       (char *)player_pcm + player_pcm_fill, 10000,
+                       &rd, &done, 16, 0);
+
+            player_pcm_fill += done;
+
+            if (done == 0) {
+                rd++;
+                err++;
+                if (err > 65536) break;
+            }
+
+            player_pos += rd;
         }
+
+        if (RETRO_IS_BIG_ENDIAN) {
+            for (i = 0; i < (int)(need_samples * 2); i++)
+                player_pcm[i] = SWAP16(player_pcm[i]);
+        }
+
+        audio_batch_cb(player_pcm, need_samples);
+        player_pcm_fill -= need_bytes;
+        memmove(player_pcm, (char *)player_pcm + need_bytes, player_pcm_fill);
     }
 
     video_cb(pixels, width, height, width * sizeof(uint16_t));
