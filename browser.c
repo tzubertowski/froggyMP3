@@ -17,6 +17,8 @@ int       browser_count  = 0;
 int       browser_sel    = 0;
 int       browser_scroll = 0;
 
+#define ROOT_PATH "/mnt/sda1/ROMS/MP3"
+
 /* Simple PRNG for random mode */
 static unsigned int prng_state = 12345;
 static int prng_next(void)
@@ -57,9 +59,8 @@ void browser_scan(void)
     d = opendir(browser_path);
     if (!d) return;
 
-    /* Add ".." unless at root */
-    if (strcmp(browser_path, "/") != 0 &&
-        strcmp(browser_path, "/mnt/sda1") != 0) {
+    /* Add ".." unless at MP3 root */
+    if (strcmp(browser_path, ROOT_PATH) != 0) {
         strcpy(browser_files[browser_count].name, "..");
         browser_files[browser_count].is_dir = 1;
         browser_count++;
@@ -101,9 +102,20 @@ void browser_enter(const char *name)
 
 void browser_back(void)
 {
-    char *slash = strrchr(browser_path, '/');
+    char *slash;
+
+    /* don't go above root */
+    if (strcmp(browser_path, ROOT_PATH) == 0)
+        return;
+
+    slash = strrchr(browser_path, '/');
     if (slash && slash != browser_path)
         *slash = '\0';
+
+    /* safety: if somehow went above root, reset */
+    if (strncmp(browser_path, ROOT_PATH, strlen(ROOT_PATH)) != 0)
+        strcpy(browser_path, ROOT_PATH);
+
     browser_scan();
 }
 
