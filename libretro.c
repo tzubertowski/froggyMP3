@@ -267,6 +267,9 @@ void retro_run(void)
             ui_dirty = 0;
         }
 
+        /* continue background loading */
+        player_bg_load();
+
         /* audio decode */
         if (!player_paused && player_mad && player_len > 0) {
             int err = 0;
@@ -286,7 +289,7 @@ void retro_run(void)
 
                 data = player_get_data(player_pos, len);
                 if (!data) {
-                    player_on_end();
+                    /* data not loaded yet, wait */
                     break;
                 }
 

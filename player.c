@@ -41,12 +41,11 @@ uint32_t player_channels  = 2;
 int16_t *player_pcm       = NULL;
 uint16_t player_pcm_fill  = 0;
 
-/* Streaming state */
-static FILE    *player_file   = NULL;
+/* Background loading state */
+static FILE    *player_file     = NULL;
 static char     player_path[MAX_PATH];
-#define STREAM_BUF_SIZE  (256 * 1024)  /* 256KB buffer */
-static uint32_t buf_file_pos  = 0;     /* file offset of buffer start */
-static uint32_t buf_fill      = 0;     /* bytes in buffer */
+static uint32_t player_loaded   = 0;   /* bytes loaded so far */
+#define CHUNK_SIZE  (32 * 1024)        /* load 32KB per frame */
 
 /* Title scrolling */
 static char  scroll_title[136];
@@ -74,54 +73,55 @@ static void setup_title(void)
     scroll_delay  = SCROLL_WAIT;
 }
 
-/* Fill stream buffer from current file position */
-static void fill_buffer(uint32_t file_pos)
+/* Continue background loading - call each frame */
+void player_bg_load(void)
 {
-    if (!player_file) return;
+    uint32_t to_read;
 
-    fseek(player_file, file_pos, SEEK_SET);
-    buf_fill = fread(player_data, 1, STREAM_BUF_SIZE, player_file);
-    buf_file_pos = file_pos;
+    if (!player_file || player_loaded >= player_len)
+        return;
+
+    to_read = player_len - player_loaded;
+    if (to_read > CHUNK_SIZE)
+        to_read = CHUNK_SIZE;
+
+    fread(player_data + player_loaded, 1, to_read, player_file);
+    player_loaded += to_read;
+
+    /* done loading */
+    if (player_loaded >= player_len) {
+        fclose(player_file);
+        player_file = NULL;
+    }
 }
 
-/* Get pointer to data at file position, refill buffer if needed */
+/* Get pointer to data - just return buffer offset */
 char *player_get_data(uint32_t pos, uint32_t need)
 {
-    uint32_t buf_offset;
+    /* wait if data not loaded yet */
+    if (pos + need > player_loaded)
+        return NULL;
 
-    /* check if requested range is in buffer */
-    if (pos >= buf_file_pos && pos + need <= buf_file_pos + buf_fill) {
-        buf_offset = pos - buf_file_pos;
-
-        /* proactive refill: if we're past halfway, shift and top up */
-        if (buf_offset > STREAM_BUF_SIZE / 2 && player_file) {
-            uint32_t keep = buf_fill - buf_offset;
-            memmove(player_data, player_data + buf_offset, keep);
-            buf_file_pos = pos;
-            fseek(player_file, pos + keep, SEEK_SET);
-            buf_fill = keep + fread(player_data + keep, 1, STREAM_BUF_SIZE - keep, player_file);
-        }
-
-        return player_data + (pos - buf_file_pos);
-    }
-
-    /* data not in buffer - full refill */
-    fill_buffer(pos);
-
-    if (buf_fill == 0) return NULL;
-    return player_data;
+    return player_data + pos;
 }
 
 int player_load(const char *path)
 {
     ID3Hdr hdr;
-    char *tmp, *data;
+    char *tmp;
     int rd, done, len;
+    uint32_t initial_load;
 
     /* close previous file */
     if (player_file) {
         fclose(player_file);
         player_file = NULL;
+    }
+
+    /* free old buffer */
+    if (player_data) {
+        free(player_data);
+        player_data = NULL;
     }
 
     player_file = fopen(path, "rb");
@@ -134,24 +134,22 @@ int player_load(const char *path)
     player_len = ftell(player_file);
     fseek(player_file, 0, SEEK_SET);
 
-    /* allocate stream buffer */
+    /* allocate full buffer for the file */
+    player_data = malloc(player_len);
     if (!player_data) {
-        player_data = malloc(STREAM_BUF_SIZE);
-        if (!player_data) {
-            fclose(player_file);
-            player_file = NULL;
-            return 0;
-        }
+        fclose(player_file);
+        player_file = NULL;
+        return 0;
     }
 
-    /* read first chunk */
-    buf_file_pos = 0;
-    buf_fill = fread(player_data, 1, STREAM_BUF_SIZE, player_file);
+    /* load first 64KB immediately for fast start */
+    initial_load = (player_len > 65536) ? 65536 : player_len;
+    player_loaded = fread(player_data, 1, initial_load, player_file);
 
     player_pos = 0;
 
     /* skip ID3 tag */
-    if (player_len > 10 && buf_fill >= 10) {
+    if (player_len > 10 && player_loaded >= 10) {
         memcpy(&hdr, player_data, 10);
         if (hdr.id[0] == 'I' && hdr.id[1] == 'D' && hdr.id[2] == '3') {
             player_pos = (hdr.size[0] & 0x7f);
@@ -171,11 +169,10 @@ int player_load(const char *path)
     player_pcm_fill = 0;
 
     /* probe first frame for metadata */
-    len = (player_len - player_pos > 4096) ? 4096 : (player_len - player_pos);
-    data = player_get_data(player_pos, len);
+    len = (player_loaded - player_pos > 4096) ? 4096 : (player_loaded - player_pos);
     tmp = malloc(32768);
-    if (tmp && data) {
-        if (mad_decode(player_mad, data, len,
+    if (tmp && len > 0) {
+        if (mad_decode(player_mad, player_data + player_pos, len,
                        tmp, 32768, &rd, &done, 16, 0) == MAD_OK || done > 0) {
             player_rate     = mad_get_samplerate(player_mad);
             player_bitrate  = mad_get_bitrate(player_mad);
@@ -200,11 +197,14 @@ void player_unload(void)
         fclose(player_file);
         player_file = NULL;
     }
-    /* keep buffer allocated for reuse */
+    if (player_data) {
+        free(player_data);
+        player_data = NULL;
+    }
     player_len = 0;
     player_pos = 0;
+    player_loaded = 0;
     player_pcm_fill = 0;
-    buf_fill = 0;
 }
 
 void player_seek(int secs)

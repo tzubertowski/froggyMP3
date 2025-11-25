@@ -35,6 +35,7 @@ void  player_unload(void);
 void  player_seek(int secs);
 void  player_toggle_pause(void);
 char *player_get_data(uint32_t pos, uint32_t need);
+void  player_bg_load(void);
 
 /* Playback control */
 void player_play_at(int idx);
