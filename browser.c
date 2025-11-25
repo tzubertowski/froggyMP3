@@ -134,7 +134,7 @@ void browser_draw(void)
 
     /* header bar */
     ui_fill(0, 0, SCREEN_W, 28, COL_HEADER_BG);
-    font_draw_text(pixels, SCREEN_W, SCREEN_H, 12, 6, "MP3 PLAYER", COL_TEXT);
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, 12, 6, "FroggyMP3", COL_TEXT);
 
     /* file list */
     start = browser_scroll;
@@ -188,7 +188,7 @@ void browser_draw(void)
     /* legend - plain text */
     legend_y = SCREEN_H - 24;
     ui_fill(0, SCREEN_H - 32, SCREEN_W, 32, COL_HEADER_BG);
-    font_draw_text(pixels, SCREEN_W, SCREEN_H, SCREEN_W - 70, legend_y,
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, 12, legend_y,
                    "A SELECT", COL_DIM);
 }
 
