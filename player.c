@@ -44,9 +44,9 @@ uint16_t player_pcm_fill  = 0;
 /* Streaming state */
 static FILE    *player_file   = NULL;
 static char     player_path[MAX_PATH];
-#define STREAM_BUF_SIZE  (64 * 1024)  /* 64KB buffer */
-static uint32_t buf_file_pos  = 0;    /* file offset of buffer start */
-static uint32_t buf_fill      = 0;    /* bytes in buffer */
+#define STREAM_BUF_SIZE  (256 * 1024)  /* 256KB buffer */
+static uint32_t buf_file_pos  = 0;     /* file offset of buffer start */
+static uint32_t buf_fill      = 0;     /* bytes in buffer */
 
 /* Title scrolling */
 static char  scroll_title[136];
@@ -87,11 +87,25 @@ static void fill_buffer(uint32_t file_pos)
 /* Get pointer to data at file position, refill buffer if needed */
 char *player_get_data(uint32_t pos, uint32_t need)
 {
-    /* check if requested range is in buffer */
-    if (pos >= buf_file_pos && pos + need <= buf_file_pos + buf_fill)
-        return player_data + (pos - buf_file_pos);
+    uint32_t buf_offset;
 
-    /* need to refill - position buffer so requested data is near start */
+    /* check if requested range is in buffer */
+    if (pos >= buf_file_pos && pos + need <= buf_file_pos + buf_fill) {
+        buf_offset = pos - buf_file_pos;
+
+        /* proactive refill: if we're past halfway, shift and top up */
+        if (buf_offset > STREAM_BUF_SIZE / 2 && player_file) {
+            uint32_t keep = buf_fill - buf_offset;
+            memmove(player_data, player_data + buf_offset, keep);
+            buf_file_pos = pos;
+            fseek(player_file, pos + keep, SEEK_SET);
+            buf_fill = keep + fread(player_data + keep, 1, STREAM_BUF_SIZE - keep, player_file);
+        }
+
+        return player_data + (pos - buf_file_pos);
+    }
+
+    /* data not in buffer - full refill */
     fill_buffer(pos);
 
     if (buf_fill == 0) return NULL;
