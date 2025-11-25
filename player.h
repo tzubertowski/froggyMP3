@@ -16,6 +16,7 @@ extern PlayMode player_mode;
 extern char     player_song[128];
 extern int      player_song_idx;
 extern int      player_paused;
+extern int      player_loading;
 
 /* Decoder state accessible for audio output */
 extern void    *player_mad;

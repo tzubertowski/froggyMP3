@@ -9,15 +9,18 @@
 /* RGB565 conversion */
 #define RGB565(r, g, b) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
 
-/* MinUI-style palette */
-#define COL_BG          RGB565(0, 0, 0)
-#define COL_TEXT        RGB565(255, 255, 255)
-#define COL_SELECT_BG   RGB565(255, 255, 255)
-#define COL_SELECT_FG   RGB565(0, 0, 0)
-#define COL_DIM         RGB565(132, 132, 132)
-#define COL_PILL        RGB565(33, 33, 33)
-#define COL_BAR_BG      RGB565(33, 33, 33)
-#define COL_BAR_FG      RGB565(255, 255, 255)
+/* Color palette - dark theme with accent */
+#define COL_BG          RGB565(18, 18, 22)
+#define COL_TEXT        RGB565(240, 240, 245)
+#define COL_SELECT_BG   RGB565(70, 130, 220)
+#define COL_SELECT_FG   RGB565(255, 255, 255)
+#define COL_DIM         RGB565(120, 120, 130)
+#define COL_PILL        RGB565(40, 40, 48)
+#define COL_BAR_BG      RGB565(50, 50, 60)
+#define COL_BAR_FG      RGB565(70, 130, 220)
+#define COL_HEADER_BG   RGB565(28, 28, 34)
+#define COL_PLAYING     RGB565(100, 200, 130)
+#define COL_ROW_ALT     RGB565(24, 24, 30)
 
 /* Global framebuffer - defined in libretro.c */
 extern uint16_t pixels[];

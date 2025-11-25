@@ -121,15 +121,20 @@ void browser_back(void)
 
 void browser_draw(void)
 {
-    int start, end, i, y, selected;
+    int start, end, i, y, selected, row;
     char label[MAX_NAME + 4];
     int legend_y, tw;
     const char *leg;
+    int is_playing;
+
+    /* get currently playing song index */
+    extern int player_song_idx;
 
     ui_clear(COL_BG);
 
-    /* header */
-    font_draw_text(pixels, SCREEN_W, SCREEN_H, 10, 8, "MP3", COL_DIM);
+    /* header bar */
+    ui_fill(0, 0, SCREEN_W, 28, COL_HEADER_BG);
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, 12, 6, "MP3 PLAYER", COL_TEXT);
 
     /* file list */
     start = browser_scroll;
@@ -137,8 +142,14 @@ void browser_draw(void)
     if (end > browser_count) end = browser_count;
 
     for (i = start; i < end; i++) {
-        y = 36 + (i - start) * 24;
+        row = i - start;
+        y = 34 + row * 24;
         selected = (i == browser_sel);
+        is_playing = (i == player_song_idx && !browser_files[i].is_dir);
+
+        /* alternating row background */
+        if (row % 2 == 1)
+            ui_fill(0, y - 2, SCREEN_W - 8, 22, COL_ROW_ALT);
 
         if (browser_files[i].is_dir)
             snprintf(label, sizeof(label), "[%s]", browser_files[i].name);
@@ -148,18 +159,20 @@ void browser_draw(void)
         }
 
         /* truncate long names */
-        if (strlen(label) > 26) {
-            label[23] = '.';
-            label[24] = '.';
+        if (strlen(label) > 28) {
             label[25] = '.';
-            label[26] = '\0';
+            label[26] = '.';
+            label[27] = '.';
+            label[28] = '\0';
         }
 
-        if (selected)
+        if (selected) {
             ui_text_pill(10, y, label, COL_SELECT_BG, COL_SELECT_FG, 7);
-        else
-            font_draw_text(pixels, SCREEN_W, SCREEN_H, 10, y, label,
-                           browser_files[i].is_dir ? COL_TEXT : COL_TEXT);
+        } else {
+            uint16_t col = browser_files[i].is_dir ? COL_DIM : COL_TEXT;
+            if (is_playing) col = COL_PLAYING;
+            font_draw_text(pixels, SCREEN_W, SCREEN_H, 10, y, label, col);
+        }
     }
 
     /* scrollbar */
@@ -167,16 +180,16 @@ void browser_draw(void)
         int bar_h = (VISIBLE_ROWS * 24 * VISIBLE_ROWS) / browser_count;
         int max_s = browser_count - VISIBLE_ROWS;
         int bar_y;
-        if (bar_h < 10) bar_h = 10;
-        bar_y = 36 + (browser_scroll * (VISIBLE_ROWS * 24 - bar_h)) / max_s;
-        ui_fill(SCREEN_W - 4, bar_y, 3, bar_h, COL_DIM);
+        if (bar_h < 12) bar_h = 12;
+        bar_y = 34 + (browser_scroll * (VISIBLE_ROWS * 24 - bar_h)) / max_s;
+        ui_pill(SCREEN_W - 6, bar_y, 4, bar_h, 2, COL_BAR_FG);
     }
 
-    /* legend */
+    /* legend - plain text */
     legend_y = SCREEN_H - 24;
-    leg = " A - SELECT ";
-    tw = font_measure_text(leg);
-    ui_legend_btn(SCREEN_W - tw - 14, legend_y, leg);
+    ui_fill(0, SCREEN_H - 32, SCREEN_W, 32, COL_HEADER_BG);
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, SCREEN_W - 70, legend_y,
+                   "A SELECT", COL_DIM);
 }
 
 int browser_find_song(const char *name)

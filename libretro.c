@@ -21,7 +21,6 @@
 #define STATE_BROWSER 0
 #define STATE_PLAYER  1
 int app_state = STATE_BROWSER;
-int ui_dirty = 1;
 
 /* Framebuffer */
 uint16_t pixels[SCREEN_W * SCREEN_H];
@@ -178,11 +177,9 @@ void retro_run(void)
         btn_held[i] = cur;
     }
 
-    /* force redraw on state change */
-    if (app_state != prev_state) {
-        ui_dirty = 1;
+    /* track state changes */
+    if (app_state != prev_state)
         prev_state = app_state;
-    }
 
     if (app_state == STATE_BROWSER) {
         /* navigation */
@@ -190,20 +187,17 @@ void retro_run(void)
             browser_sel--;
             if (browser_sel < browser_scroll)
                 browser_scroll = browser_sel;
-            ui_dirty = 1;
         }
         if (btn_down[3] && browser_sel < browser_count - 1) {
             browser_sel++;
             if (browser_sel >= browser_scroll + VISIBLE_ROWS)
                 browser_scroll = browser_sel - VISIBLE_ROWS + 1;
-            ui_dirty = 1;
         }
 
         /* select */
         if ((btn_down[0] || btn_down[6]) && browser_count > 0) {
             if (browser_files[browser_sel].is_dir) {
                 browser_enter(browser_files[browser_sel].name);
-                ui_dirty = 1;
             } else {
                 player_play_at(browser_sel);
             }
@@ -212,39 +206,30 @@ void retro_run(void)
         /* back */
         if (btn_down[1]) {
             browser_back();
-            ui_dirty = 1;
         }
 
-        if (ui_dirty) {
-            browser_draw();
-            ui_dirty = 0;
-        }
+        browser_draw();
     }
     else if (app_state == STATE_PLAYER) {
         /* play/pause */
         if (btn_down[0]) {
             player_toggle_pause();
-            ui_dirty = 1;
         }
 
         /* seek */
         if (btn_down[4] || btn_down[8]) {
             player_seek(-5);
-            ui_dirty = 1;
         }
         if (btn_down[5] || btn_down[9]) {
             player_seek(5);
-            ui_dirty = 1;
         }
 
         /* mode cycling */
         if (btn_down[2]) {
             player_cycle_mode(-1);
-            ui_dirty = 1;
         }
         if (btn_down[3]) {
             player_cycle_mode(1);
-            ui_dirty = 1;
         }
 
         /* prev/next song */
@@ -264,21 +249,17 @@ void retro_run(void)
         /* back to browser */
         if (btn_down[1] || btn_down[6]) {
             app_state = STATE_BROWSER;
-            ui_dirty = 1;
         }
 
-        player_tick_scroll(&ui_dirty);
-
-        /* always redraw player - progress bar updates continuously */
+        player_tick_scroll(NULL);
         player_draw();
-        ui_dirty = 0;
     }
 
     /* continue background loading (runs in any state) */
     player_bg_load();
 
-    /* audio decode (runs in any state if playing) */
-    if (!player_paused && player_mad && player_len > 0) {
+    /* audio decode (runs in any state if playing and not loading) */
+    if (!player_paused && !player_loading && player_mad && player_len > 0) {
         int err = 0;
 
         while (player_pcm_fill <= need_bytes) {
@@ -367,7 +348,6 @@ bool retro_load_game(const struct retro_game_info *info)
                 player_song_idx = browser_find_song(player_song);
                 player_setup_title();
                 app_state = STATE_PLAYER;
-                ui_dirty = 1;
             }
         }
     }

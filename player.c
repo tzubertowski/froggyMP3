@@ -9,7 +9,6 @@
 
 /* External app state flag - defined in libretro.c */
 extern int app_state;
-extern int ui_dirty;
 
 #define STATE_BROWSER 0
 #define STATE_PLAYER  1
@@ -29,6 +28,10 @@ PlayMode player_mode      = MODE_NEXT;
 char     player_song[128] = "";
 int      player_song_idx  = -1;
 int      player_paused    = 0;
+int      player_loading   = 0;
+
+/* Minimum bytes needed before playback starts (128KB or file size) */
+#define MIN_BUFFER_START 131072
 
 void    *player_mad       = NULL;
 char    *player_data      = NULL;
@@ -88,10 +91,15 @@ void player_bg_load(void)
     fread(player_data + player_loaded, 1, to_read, player_file);
     player_loaded += to_read;
 
+    /* Clear loading state once we have enough data */
+    if (player_loading && player_loaded >= MIN_BUFFER_START)
+        player_loading = 0;
+
     /* done loading */
     if (player_loaded >= player_len) {
         fclose(player_file);
         player_file = NULL;
+        player_loading = 0;
     }
 }
 
@@ -142,8 +150,8 @@ int player_load(const char *path)
         return 0;
     }
 
-    /* load first 64KB immediately for fast start */
-    initial_load = (player_len > 65536) ? 65536 : player_len;
+    /* load first 128KB immediately to avoid choppy start */
+    initial_load = (player_len > 131072) ? 131072 : player_len;
     player_loaded = fread(player_data, 1, initial_load, player_file);
 
     player_pos = 0;
@@ -184,6 +192,13 @@ int player_load(const char *path)
     }
 
     player_paused = 0;
+
+    /* Start in loading state if file needs more buffering */
+    if (player_len > MIN_BUFFER_START && player_loaded < MIN_BUFFER_START)
+        player_loading = 1;
+    else
+        player_loading = 0;
+
     return 1;
 }
 
@@ -254,7 +269,6 @@ void player_play_at(int idx)
         player_song_idx = idx;
         player_setup_title();
         app_state = STATE_PLAYER;
-        ui_dirty = 1;
     }
 }
 
@@ -268,7 +282,6 @@ void player_next(void)
         player_song[0] = '\0';
         player_song_idx = -1;
         app_state = STATE_BROWSER;
-        ui_dirty = 1;
     }
 }
 
@@ -289,7 +302,6 @@ void player_random(void)
         player_song[0] = '\0';
         player_song_idx = -1;
         app_state = STATE_BROWSER;
-        ui_dirty = 1;
     }
 }
 
@@ -315,7 +327,6 @@ void player_on_end(void)
             mad_uninit(player_mad);
             player_mad = mad_init();
         }
-        ui_dirty = 1;
         break;
     case MODE_NEXT:
         player_next();
@@ -329,7 +340,6 @@ void player_on_end(void)
         player_song[0] = '\0';
         player_song_idx = -1;
         app_state = STATE_BROWSER;
-        ui_dirty = 1;
         break;
     }
 }
@@ -346,7 +356,6 @@ void player_tick_scroll(int *dirty)
             scroll_offset = 0;
             scroll_delay  = SCROLL_WAIT;
             scroll_needed = 1;
-            *dirty = 1;
         }
         return;
     }
@@ -360,7 +369,7 @@ void player_tick_scroll(int *dirty)
         scroll_delay  = SCROLL_WAIT;
         scroll_needed = 2;
     }
-    *dirty = 1;
+    (void)dirty; /* unused now - always redraw */
 }
 
 void player_draw(void)
@@ -368,18 +377,29 @@ void player_draw(void)
     int title_y, tw, tx;
     int bar_x, bar_y, bar_w, bar_h, prog_w;
     int ctrl_y;
-    const char *seek_l, *seek_r, *status, *mode_str;
+    const char *status, *mode_str;
     int sw, sx;
     int mode_w, mode_x, mode_y;
-    int leg_y;
 
     ui_clear(COL_BG);
 
-    /* header */
-    font_draw_text(pixels, SCREEN_W, SCREEN_H, 10, 8, "NOW PLAYING", COL_DIM);
+    /* Show loading screen while buffering */
+    if (player_loading) {
+        const char *msg = "LOADING...";
+        int mw = font_measure_text(msg);
+        ui_fill(0, 0, SCREEN_W, 28, COL_HEADER_BG);
+        font_draw_text(pixels, SCREEN_W, SCREEN_H, 12, 6, "NOW PLAYING", COL_TEXT);
+        font_draw_text(pixels, SCREEN_W, SCREEN_H,
+                       (SCREEN_W - mw) / 2, SCREEN_H / 2 - 8, msg, COL_DIM);
+        return;
+    }
+
+    /* header bar */
+    ui_fill(0, 0, SCREEN_W, 28, COL_HEADER_BG);
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, 12, 6, "NOW PLAYING", COL_TEXT);
 
     /* title (scrolling if needed) */
-    title_y = 70;
+    title_y = 55;
     tw = font_measure_text(scroll_title);
 
     if (tw <= TITLE_MAX_W) {
@@ -392,59 +412,62 @@ void player_draw(void)
     }
 
     /* progress bar */
-    bar_y = 120;
-    bar_h = 8;
+    bar_y = 95;
+    bar_h = 6;
     bar_w = SCREEN_W - 40;
     bar_x = 20;
 
-    ui_pill(bar_x, bar_y, bar_w, bar_h, 4, COL_BAR_BG);
+    ui_pill(bar_x, bar_y, bar_w, bar_h, 3, COL_BAR_BG);
 
     if (player_len > player_start) {
         prog_w = ((player_pos - player_start) * bar_w) / (player_len - player_start);
-        if (prog_w > 8)
-            ui_pill(bar_x, bar_y, prog_w, bar_h, 4, COL_BAR_FG);
+        if (prog_w > 6)
+            ui_pill(bar_x, bar_y, prog_w, bar_h, 3, COL_BAR_FG);
         else if (prog_w > 0)
             ui_fill(bar_x, bar_y, prog_w, bar_h, COL_BAR_FG);
     }
 
-    /* controls row */
-    ctrl_y = 153;
+    /* controls row: seek left, status, seek right */
+    ctrl_y = 125;
 
-    seek_l = "< 5S";
-    sw = font_measure_text(seek_l);
-    sx = 30;
-    ui_pill(sx - 4, ctrl_y - 3, sw + 8, 22, 10, COL_PILL);
-    font_draw_text(pixels, SCREEN_W, SCREEN_H, sx, ctrl_y, seek_l, COL_TEXT);
+    /* seek left */
+    sw = font_measure_text("< 5S");
+    sx = 24;
+    ui_pill(sx - 4, ctrl_y - 4, sw + 8, 24, 12, COL_PILL);
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, sx, ctrl_y, "< 5S", COL_TEXT);
 
-    status = player_paused ? " PAUSED " : " PLAYING ";
+    /* status */
+    status = player_paused ? "PAUSED" : "PLAYING";
     sw = font_measure_text(status);
     sx = (SCREEN_W - sw) / 2;
-    ui_pill(sx - 4, ctrl_y - 3, sw + 8, 22, 10, player_paused ? COL_PILL : COL_SELECT_BG);
+    ui_pill(sx - 12, ctrl_y - 5, sw + 24, 26, 13, player_paused ? COL_PILL : COL_SELECT_BG);
     font_draw_text(pixels, SCREEN_W, SCREEN_H, sx, ctrl_y, status,
                    player_paused ? COL_DIM : COL_SELECT_FG);
 
-    seek_r = "5S >";
-    sw = font_measure_text(seek_r);
-    sx = SCREEN_W - sw - 30;
-    ui_pill(sx - 4, ctrl_y - 3, sw + 8, 22, 10, COL_PILL);
-    font_draw_text(pixels, SCREEN_W, SCREEN_H, sx, ctrl_y, seek_r, COL_TEXT);
+    /* seek right */
+    sw = font_measure_text("5S >");
+    sx = SCREEN_W - sw - 24;
+    ui_pill(sx - 4, ctrl_y - 4, sw + 8, 24, 12, COL_PILL);
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, sx, ctrl_y, "5S >", COL_TEXT);
 
     /* playback mode */
-    mode_y = 185;
+    mode_y = 165;
     switch (player_mode) {
     case MODE_NORMAL: mode_str = "STOP AT END"; break;
     case MODE_NEXT:   mode_str = "PLAY NEXT";   break;
     case MODE_REPEAT: mode_str = "REPEAT";      break;
-    case MODE_RANDOM: mode_str = "RANDOM";      break;
+    case MODE_RANDOM: mode_str = "SHUFFLE";     break;
     default:          mode_str = "PLAY NEXT";   break;
     }
     mode_w = font_measure_text(mode_str);
     mode_x = (SCREEN_W - mode_w) / 2;
-    ui_pill(mode_x - 6, mode_y - 3, mode_w + 12, 22, 10, COL_PILL);
+    ui_pill(mode_x - 8, mode_y - 4, mode_w + 16, 24, 12, COL_PILL);
     font_draw_text(pixels, SCREEN_W, SCREEN_H, mode_x, mode_y, mode_str, COL_TEXT);
 
-    /* legend */
-    leg_y = SCREEN_H - 24;
-    ui_legend_btn(10, leg_y, " Y/X - PREV/NEXT ");
-    ui_legend_btn(SCREEN_W - 40, leg_y, " B ");
+    /* footer bar - plain text */
+    ui_fill(0, SCREEN_H - 32, SCREEN_W, 32, COL_HEADER_BG);
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, 12, SCREEN_H - 24,
+                   "Y/X PREV/NEXT", COL_DIM);
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, SCREEN_W - 50, SCREEN_H - 24,
+                   "B BACK", COL_DIM);
 }
