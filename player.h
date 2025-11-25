@@ -49,6 +49,7 @@ void player_on_end(void);
 
 /* Rendering */
 void player_draw(void);
+void player_setup_title(void);
 
 /* Title scroll update (call each frame when playing) */
 void player_tick_scroll(int *dirty);

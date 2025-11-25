@@ -56,7 +56,7 @@ static int   scroll_needed  = 0;
 #define SCROLL_SPEED  1
 #define TITLE_MAX_W   280
 
-static void setup_title(void)
+void player_setup_title(void)
 {
     int len, tw;
 
@@ -252,7 +252,7 @@ void player_play_at(int idx)
         strncpy(player_song, browser_files[idx].name, 127);
         player_song[127] = '\0';
         player_song_idx = idx;
-        setup_title();
+        player_setup_title();
         app_state = STATE_PLAYER;
         ui_dirty = 1;
     }

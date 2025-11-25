@@ -160,6 +160,7 @@ void retro_run(void)
         RETRO_DEVICE_ID_JOYPAD_X
     };
     static bool updated = false;
+    static int prev_state = -1;
     uint32_t need_samples, need_bytes;
     int i, cur;
 
@@ -175,6 +176,12 @@ void retro_run(void)
         cur = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, buttons[i]);
         btn_down[i] = cur && !btn_held[i];
         btn_held[i] = cur;
+    }
+
+    /* force redraw on state change */
+    if (app_state != prev_state) {
+        ui_dirty = 1;
+        prev_state = app_state;
     }
 
     if (app_state == STATE_BROWSER) {
@@ -358,7 +365,9 @@ bool retro_load_game(const struct retro_game_info *info)
                 strncpy(player_song, slash + 1, 127);
                 player_song[127] = '\0';
                 player_song_idx = browser_find_song(player_song);
+                player_setup_title();
                 app_state = STATE_PLAYER;
+                ui_dirty = 1;
             }
         }
     }
