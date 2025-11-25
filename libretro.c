@@ -129,6 +129,18 @@ static char scrolling_title[MAX_NAME_LEN + 8]; // Extra space for padding
 #define SCROLL_SPEED 1          // Pixels per frame
 #define TITLE_MAX_WIDTH 280     // Max visible width for title
 
+// Playback modes
+typedef enum {
+    PLAYBACK_NORMAL,   // Play once, stop at end
+    PLAYBACK_NEXT,     // Play next song when current ends
+    PLAYBACK_REPEAT,   // Repeat current song
+    PLAYBACK_RANDOM,   // Play random song when current ends
+    PLAYBACK_MODE_COUNT
+} PlaybackMode;
+
+static PlaybackMode playback_mode = PLAYBACK_NEXT;
+static int current_song_index = -1;  // Index in file_list of currently playing song
+
 // Forward declarations
 static void scan_directory(void);
 static void render_browser(void);
@@ -140,6 +152,10 @@ static void render_text_pillbox(int x, int y, const char *text, uint16_t bg_colo
 static int load_mp3_file(const char *path);
 static void unload_mp3(void);
 static void seek_mp3(int seconds);
+static void play_song_at_index(int index);
+static void play_next_song(void);
+static void play_prev_song(void);
+static void play_random_song(void);
 
 // Compare function for sorting (directories first, then alphabetical)
 static int compare_entries(const void *a, const void *b) {
@@ -400,9 +416,11 @@ static void render_browser(void) {
         }
     }
 
-    // Legend at bottom
+    // Legend at bottom - right aligned
     int legend_y = SCREEN_HEIGHT - 24;
-    render_legend_button(SCREEN_WIDTH - 90, legend_y, " A - SELECT ");
+    const char *select_text = " A - SELECT ";
+    int select_width = font_measure_text(select_text);
+    render_legend_button(SCREEN_WIDTH - select_width - 14, legend_y, select_text);
 }
 
 // Render player screen
@@ -472,12 +490,25 @@ static void render_player(void) {
     render_rounded_rect(seek_right_x - 4, controls_y - 3, seek_right_width + 8, 22, 10, COLOR_LEGEND_BG);
     font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, seek_right_x, controls_y, seek_right, COLOR_LEGEND);
 
-    // Legend at bottom - centered single button
+    // Playback mode selector (below controls)
+    int mode_y = 185;
+    const char *mode_text;
+    switch (playback_mode) {
+        case PLAYBACK_NORMAL: mode_text = "STOP AT END"; break;
+        case PLAYBACK_NEXT:   mode_text = "PLAY NEXT"; break;
+        case PLAYBACK_REPEAT: mode_text = "REPEAT"; break;
+        case PLAYBACK_RANDOM: mode_text = "RANDOM"; break;
+        default:              mode_text = "PLAY NEXT"; break;
+    }
+    int mode_width = font_measure_text(mode_text);
+    int mode_x = (SCREEN_WIDTH - mode_width) / 2;
+    render_rounded_rect(mode_x - 6, mode_y - 3, mode_width + 12, 22, 10, COLOR_LEGEND_BG);
+    font_draw_text(pixels, SCREEN_WIDTH, SCREEN_HEIGHT, mode_x, mode_y, mode_text, COLOR_LEGEND);
+
+    // Legend at bottom
     int legend_y = SCREEN_HEIGHT - 24;
-    const char *menu_text = " B - MENU ";
-    int menu_width = font_measure_text(menu_text);
-    int menu_x = (SCREEN_WIDTH - menu_width) / 2;
-    render_legend_button(menu_x, legend_y, menu_text);
+    render_legend_button(PADDING, legend_y, " Y/X - PREV/NEXT ");
+    render_legend_button(SCREEN_WIDTH - 85, legend_y, " START - BACK ");
 }
 
 // Load MP3 file
@@ -635,6 +666,137 @@ static void seek_mp3(int seconds) {
     log_cb(RETRO_LOG_INFO, "[froggymp3] Seek to position %u\n", mp3Position);
 }
 
+// Simple pseudo-random number generator
+static unsigned int rand_seed = 12345;
+static int simple_rand(void) {
+    rand_seed = rand_seed * 1103515245 + 12345;
+    return (rand_seed >> 16) & 0x7FFF;
+}
+
+// Find index of a song in file_list by name
+static int find_song_index(const char *name) {
+    for (int i = 0; i < file_count; i++) {
+        if (!file_list[i].is_dir && strcmp(file_list[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Count MP3 files in file_list
+static int count_mp3_files(void) {
+    int count = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (!file_list[i].is_dir) count++;
+    }
+    return count;
+}
+
+// Get next MP3 index (skipping directories)
+static int get_next_mp3_index(int current) {
+    int start = (current < 0) ? 0 : current + 1;
+    for (int i = start; i < file_count; i++) {
+        if (!file_list[i].is_dir) return i;
+    }
+    // Wrap around to beginning
+    for (int i = 0; i < start && i < file_count; i++) {
+        if (!file_list[i].is_dir) return i;
+    }
+    return -1;
+}
+
+// Get previous MP3 index (skipping directories)
+static int get_prev_mp3_index(int current) {
+    int start = (current <= 0) ? file_count - 1 : current - 1;
+    for (int i = start; i >= 0; i--) {
+        if (!file_list[i].is_dir) return i;
+    }
+    // Wrap around to end
+    for (int i = file_count - 1; i > start; i--) {
+        if (!file_list[i].is_dir) return i;
+    }
+    return -1;
+}
+
+// Get random MP3 index (different from current if possible)
+static int get_random_mp3_index(int current) {
+    int mp3_count = count_mp3_files();
+    if (mp3_count == 0) return -1;
+    if (mp3_count == 1) return get_next_mp3_index(-1);
+
+    int attempts = 10;
+    while (attempts-- > 0) {
+        int target = simple_rand() % mp3_count;
+        int count = 0;
+        for (int i = 0; i < file_count; i++) {
+            if (!file_list[i].is_dir) {
+                if (count == target && i != current) {
+                    return i;
+                }
+                count++;
+            }
+        }
+    }
+    // Fallback to next
+    return get_next_mp3_index(current);
+}
+
+// Play song at given index in file_list
+static void play_song_at_index(int index) {
+    if (index < 0 || index >= file_count || file_list[index].is_dir) {
+        return;
+    }
+
+    char full_path[MAX_PATH_LEN];
+    snprintf(full_path, MAX_PATH_LEN, "%s/%s", current_path, file_list[index].name);
+
+    if (load_mp3_file(full_path)) {
+        strncpy(current_song, file_list[index].name, MAX_NAME_LEN - 1);
+        current_song[MAX_NAME_LEN - 1] = '\0';
+        current_song_index = index;
+        init_scrolling_title();
+        app_state = STATE_PLAYING;
+        ui_dirty = 1;
+    }
+}
+
+// Play next song
+static void play_next_song(void) {
+    int next = get_next_mp3_index(current_song_index);
+    if (next >= 0) {
+        play_song_at_index(next);
+    } else {
+        // No more songs
+        unload_mp3();
+        current_song[0] = '\0';
+        current_song_index = -1;
+        app_state = STATE_BROWSER;
+        ui_dirty = 1;
+    }
+}
+
+// Play previous song
+static void play_prev_song(void) {
+    int prev = get_prev_mp3_index(current_song_index);
+    if (prev >= 0) {
+        play_song_at_index(prev);
+    }
+}
+
+// Play random song
+static void play_random_song(void) {
+    int next = get_random_mp3_index(current_song_index);
+    if (next >= 0) {
+        play_song_at_index(next);
+    } else {
+        unload_mp3();
+        current_song[0] = '\0';
+        current_song_index = -1;
+        app_state = STATE_BROWSER;
+        ui_dirty = 1;
+    }
+}
+
 static void fallback_log(enum retro_log_level level, const char *fmt, ...) {
     va_list va;
     va_start(va, fmt);
@@ -748,19 +910,21 @@ void retro_run(void) {
 
     // Track button states
     int buttons[] = {
-        RETRO_DEVICE_ID_JOYPAD_A,
-        RETRO_DEVICE_ID_JOYPAD_B,
-        RETRO_DEVICE_ID_JOYPAD_UP,
-        RETRO_DEVICE_ID_JOYPAD_DOWN,
-        RETRO_DEVICE_ID_JOYPAD_LEFT,
-        RETRO_DEVICE_ID_JOYPAD_RIGHT,
-        RETRO_DEVICE_ID_JOYPAD_START,
-        RETRO_DEVICE_ID_JOYPAD_SELECT,
-        RETRO_DEVICE_ID_JOYPAD_L,
-        RETRO_DEVICE_ID_JOYPAD_R
+        RETRO_DEVICE_ID_JOYPAD_A,      // 0
+        RETRO_DEVICE_ID_JOYPAD_B,      // 1
+        RETRO_DEVICE_ID_JOYPAD_UP,     // 2
+        RETRO_DEVICE_ID_JOYPAD_DOWN,   // 3
+        RETRO_DEVICE_ID_JOYPAD_LEFT,   // 4
+        RETRO_DEVICE_ID_JOYPAD_RIGHT,  // 5
+        RETRO_DEVICE_ID_JOYPAD_START,  // 6
+        RETRO_DEVICE_ID_JOYPAD_SELECT, // 7
+        RETRO_DEVICE_ID_JOYPAD_L,      // 8
+        RETRO_DEVICE_ID_JOYPAD_R,      // 9
+        RETRO_DEVICE_ID_JOYPAD_Y,      // 10
+        RETRO_DEVICE_ID_JOYPAD_X       // 11
     };
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 12; i++) {
         int pressed = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, buttons[i]);
         key_just_pressed[i] = (pressed && !key_pressed[i]);
         key_pressed[i] = pressed;
@@ -793,16 +957,8 @@ void retro_run(void) {
                 enter_directory(entry->name);
                 ui_dirty = 1;
             } else {
-                // Load and play MP3
-                char full_path[MAX_PATH_LEN];
-                snprintf(full_path, MAX_PATH_LEN, "%s/%s", current_path, entry->name);
-                if (load_mp3_file(full_path)) {
-                    strncpy(current_song, entry->name, MAX_NAME_LEN - 1);
-                    current_song[MAX_NAME_LEN - 1] = '\0';
-                    init_scrolling_title();
-                    app_state = STATE_PLAYING;
-                    ui_dirty = 1;
-                }
+                // Load and play MP3 using play_song_at_index
+                play_song_at_index(selected_index);
             }
         }
 
@@ -848,16 +1004,42 @@ void retro_run(void) {
             ui_dirty = 1;
         }
 
-        // SELECT - return to browser (keep playing)
-        if (key_just_pressed[7]) {
-            app_state = STATE_BROWSER;
+        // UP - cycle playback mode backward
+        if (key_just_pressed[2]) {
+            if (playback_mode == 0) {
+                playback_mode = PLAYBACK_MODE_COUNT - 1;
+            } else {
+                playback_mode--;
+            }
             ui_dirty = 1;
         }
 
-        // START - stop and return to browser
-        if (key_just_pressed[6]) {
-            unload_mp3();
-            current_song[0] = '\0';
+        // DOWN - cycle playback mode forward
+        if (key_just_pressed[3]) {
+            playback_mode = (playback_mode + 1) % PLAYBACK_MODE_COUNT;
+            ui_dirty = 1;
+        }
+
+        // Y - play previous song
+        if (key_just_pressed[10]) {
+            if (playback_mode == PLAYBACK_RANDOM) {
+                play_random_song();
+            } else {
+                play_prev_song();
+            }
+        }
+
+        // X - play next song
+        if (key_just_pressed[11]) {
+            if (playback_mode == PLAYBACK_RANDOM) {
+                play_random_song();
+            } else {
+                play_next_song();
+            }
+        }
+
+        // B or START - return to browser (keep playing)
+        if (key_just_pressed[1] || key_just_pressed[6]) {
             app_state = STATE_BROWSER;
             ui_dirty = 1;
         }
@@ -909,12 +1091,39 @@ void retro_run(void) {
                 if (mp3Position + length > mp3Length) {
                     length = mp3Length - mp3Position;
                     if (length <= 128) {
-                        // Song ended - return to browser
-                        log_cb(RETRO_LOG_INFO, "[froggymp3] Song ended\n");
-                        unload_mp3();
-                        current_song[0] = '\0';
-                        app_state = STATE_BROWSER;
-                        ui_dirty = 1;
+                        // Song ended - handle based on playback mode
+                        log_cb(RETRO_LOG_INFO, "[froggymp3] Song ended, mode=%d\n", playback_mode);
+
+                        switch (playback_mode) {
+                            case PLAYBACK_REPEAT:
+                                // Restart current song
+                                mp3Position = mp3StartPosition;
+                                soundEnd = 0;
+                                if (mp3Mad) {
+                                    mad_uninit(mp3Mad);
+                                    mp3Mad = mad_init();
+                                }
+                                ui_dirty = 1;
+                                break;
+
+                            case PLAYBACK_NEXT:
+                                play_next_song();
+                                break;
+
+                            case PLAYBACK_RANDOM:
+                                play_random_song();
+                                break;
+
+                            case PLAYBACK_NORMAL:
+                            default:
+                                // Stop playback
+                                unload_mp3();
+                                current_song[0] = '\0';
+                                current_song_index = -1;
+                                app_state = STATE_BROWSER;
+                                ui_dirty = 1;
+                                break;
+                        }
                         break;
                     }
                 }
@@ -986,16 +1195,22 @@ bool retro_load_game(const struct retro_game_info *info) {
                 current_path[dir_len] = '\0';
             }
 
+            // Scan the directory first so we can find the song index
+            scan_directory();
+
             // Load the MP3
             if (load_mp3_file(info->path)) {
                 strncpy(current_song, last_slash + 1, MAX_NAME_LEN - 1);
                 current_song[MAX_NAME_LEN - 1] = '\0';
+                current_song_index = find_song_index(current_song);
                 init_scrolling_title();
                 app_state = STATE_PLAYING;
             }
         }
+    }
 
-        // Scan the directory anyway
+    // Make sure directory is scanned if we haven't already
+    if (file_count == 0) {
         scan_directory();
     }
 
