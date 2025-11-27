@@ -258,8 +258,8 @@ void retro_run(void)
     /* continue background loading (runs in any state) */
     player_bg_load();
 
-    /* audio decode (runs in any state if playing and not loading) */
-    if (!player_paused && !player_loading && player_mad && player_len > 0) {
+    /* audio decode - fill PCM buffer */
+    if (!player_paused && player_mad && player_len > 0) {
         int err = 0;
 
         while (player_pcm_fill <= need_bytes) {
@@ -296,14 +296,24 @@ void retro_run(void)
             player_pos += rd;
         }
 
-        if (RETRO_IS_BIG_ENDIAN) {
-            for (i = 0; i < (int)(need_samples * 2); i++)
-                player_pcm[i] = SWAP16(player_pcm[i]);
+        /* warmup: let decoder fill PCM buffer before outputting */
+        if (player_warmup > 0) {
+            player_warmup--;
+            if (player_warmup == 0)
+                player_loading = 0;  /* hide LOADING screen */
         }
 
-        audio_batch_cb(player_pcm, need_samples);
-        player_pcm_fill -= need_bytes;
-        memmove(player_pcm, (char *)player_pcm + need_bytes, player_pcm_fill);
+        /* only output audio after warmup and if we have enough PCM data */
+        if (!player_loading && player_pcm_fill >= need_bytes) {
+            if (RETRO_IS_BIG_ENDIAN) {
+                for (i = 0; i < (int)(need_samples * 2); i++)
+                    player_pcm[i] = SWAP16(player_pcm[i]);
+            }
+
+            audio_batch_cb(player_pcm, need_samples);
+            player_pcm_fill -= need_bytes;
+            memmove(player_pcm, (char *)player_pcm + need_bytes, player_pcm_fill);
+        }
     }
 
     video_cb(pixels, width, height, width * sizeof(uint16_t));

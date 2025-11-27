@@ -29,9 +29,10 @@ char     player_song[128] = "";
 int      player_song_idx  = -1;
 int      player_paused    = 0;
 int      player_loading   = 0;
+int      player_warmup    = 0;   /* frames to wait before audio output */
 
-/* Minimum bytes needed before playback starts (128KB or file size) */
-#define MIN_BUFFER_START 131072
+/* Minimum bytes needed before playback starts (1MB or file size) */
+#define MIN_BUFFER_START (1024 * 1024)
 
 void    *player_mad       = NULL;
 char    *player_data      = NULL;
@@ -48,7 +49,7 @@ uint16_t player_pcm_fill  = 0;
 static FILE    *player_file     = NULL;
 static char     player_path[MAX_PATH];
 static uint32_t player_loaded   = 0;   /* bytes loaded so far */
-#define CHUNK_SIZE  (32 * 1024)        /* load 32KB per frame */
+#define CHUNK_SIZE  (16 * 1024)        /* load 16KB per frame - smaller to avoid stutter */
 
 /* Title scrolling */
 static char  scroll_title[136];
@@ -91,15 +92,10 @@ void player_bg_load(void)
     fread(player_data + player_loaded, 1, to_read, player_file);
     player_loaded += to_read;
 
-    /* Clear loading state once we have enough data */
-    if (player_loading && player_loaded >= MIN_BUFFER_START)
-        player_loading = 0;
-
     /* done loading */
     if (player_loaded >= player_len) {
         fclose(player_file);
         player_file = NULL;
-        player_loading = 0;
     }
 }
 
@@ -150,8 +146,8 @@ int player_load(const char *path)
         return 0;
     }
 
-    /* load first 128KB immediately to avoid choppy start */
-    initial_load = (player_len > 131072) ? 131072 : player_len;
+    /* load first 256KB, rest via background loading */
+    initial_load = (player_len > 262144) ? 262144 : player_len;
     player_loaded = fread(player_data, 1, initial_load, player_file);
 
     player_pos = 0;
@@ -192,12 +188,8 @@ int player_load(const char *path)
     }
 
     player_paused = 0;
-
-    /* Start in loading state if file needs more buffering */
-    if (player_len > MIN_BUFFER_START && player_loaded < MIN_BUFFER_START)
-        player_loading = 1;
-    else
-        player_loading = 0;
+    player_loading = 1;  /* show LOADING screen */
+    player_warmup = 10;  /* wait 10 frames for PCM buffer to fill */
 
     return 1;
 }
