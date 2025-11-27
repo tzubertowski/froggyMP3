@@ -69,7 +69,7 @@ void browser_scan(void)
     while ((e = readdir(d)) && browser_count < MAX_FILES) {
         if (e->d_name[0] == '.') continue;
 
-        if (e->d_type == DT_DIR || e->d_type == DTYPE_DIRECTORY) {
+        if (e->d_type == DT_DIR) {
             strncpy(browser_files[browser_count].name, e->d_name, MAX_NAME - 1);
             browser_files[browser_count].name[MAX_NAME - 1] = '\0';
             browser_files[browser_count].is_dir = 1;

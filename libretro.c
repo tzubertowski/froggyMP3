@@ -13,7 +13,6 @@
 #include "ui.h"
 #include "browser.h"
 #include "player.h"
-#include "libmad/libmad.h"
 
 #define FPS 50
 
@@ -29,17 +28,14 @@ uint16_t pixels[SCREEN_W * SCREEN_H];
 static void fallback_log(enum retro_log_level level, const char *fmt, ...);
 retro_log_printf_t       log_cb = fallback_log;
 retro_video_refresh_t    video_cb;
-static retro_audio_sample_t       audio_cb;
 static retro_audio_sample_batch_t audio_batch_cb;
 retro_environment_t      environ_cb;
-static retro_input_poll_t         input_poll_cb;
-static retro_input_state_t        input_state_cb;
-
-int width, height;
+static retro_input_poll_t  input_poll_cb;
+static retro_input_state_t input_state_cb;
 
 /* Input tracking */
-static int btn_held[16];
-static int btn_down[16];
+static int btn_held[12];
+static int btn_down[12];
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -49,16 +45,9 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
     va_end(va);
 }
 
-static void update_variables(void) { }
-
 void retro_init(void)
 {
-    update_variables();
-
-    player_pcm = (int16_t *)malloc(32768);
-    width  = SCREEN_W;
-    height = SCREEN_H;
-
+    player_pcm = malloc(64 * 1024);  /* 64KB PCM buffer */
     font_init();
     browser_scan();
 }
@@ -66,21 +55,15 @@ void retro_init(void)
 void retro_deinit(void)
 {
     player_unload();
-    if (player_pcm) {
-        free(player_pcm);
-        player_pcm = NULL;
-    }
+    free(player_pcm);
+    player_pcm = NULL;
 }
 
-unsigned retro_api_version(void)
-{
-    return RETRO_API_VERSION;
-}
+unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 
 void retro_set_controller_port_device(unsigned port, unsigned device)
 {
-    (void)port;
-    (void)device;
+    (void)port; (void)device;
 }
 
 void retro_get_system_info(struct retro_system_info *info)
@@ -115,8 +98,7 @@ void retro_set_environment(retro_environment_t cb)
         {"RetroPad", RETRO_DEVICE_JOYPAD},
     };
     static const struct retro_controller_info ports[] = {
-        {port, 1},
-        {NULL, 0},
+        {port, 1}, {NULL, 0},
     };
 
     environ_cb = cb;
@@ -132,207 +114,130 @@ void retro_set_environment(retro_environment_t cb)
         filestream_vfs_init(&vfs_iface_info);
 }
 
-void retro_set_audio_sample(retro_audio_sample_t cb)       { audio_cb = cb; }
+void retro_set_audio_sample(retro_audio_sample_t cb) { (void)cb; }
 void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audio_batch_cb = cb; }
-void retro_set_input_poll(retro_input_poll_t cb)           { input_poll_cb = cb; }
-void retro_set_input_state(retro_input_state_t cb)         { input_state_cb = cb; }
-void retro_set_video_refresh(retro_video_refresh_t cb)     { video_cb = cb; }
+void retro_set_input_poll(retro_input_poll_t cb) { input_poll_cb = cb; }
+void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
+void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
 void retro_reset(void) { }
 
-#define SAMPLES_PER_FRAME(rate) ((rate) / FPS)
-#define BYTES_PER_FRAME(rate)   (SAMPLES_PER_FRAME(rate) * 4)
-
-void retro_run(void)
+static void poll_input(void)
 {
-    static int buttons[] = {
-        RETRO_DEVICE_ID_JOYPAD_A,
-        RETRO_DEVICE_ID_JOYPAD_B,
-        RETRO_DEVICE_ID_JOYPAD_UP,
-        RETRO_DEVICE_ID_JOYPAD_DOWN,
-        RETRO_DEVICE_ID_JOYPAD_LEFT,
-        RETRO_DEVICE_ID_JOYPAD_RIGHT,
-        RETRO_DEVICE_ID_JOYPAD_START,
-        RETRO_DEVICE_ID_JOYPAD_SELECT,
-        RETRO_DEVICE_ID_JOYPAD_L,
-        RETRO_DEVICE_ID_JOYPAD_R,
-        RETRO_DEVICE_ID_JOYPAD_Y,
-        RETRO_DEVICE_ID_JOYPAD_X
+    static const int buttons[] = {
+        RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_B,
+        RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_ID_JOYPAD_DOWN,
+        RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_RIGHT,
+        RETRO_DEVICE_ID_JOYPAD_START, RETRO_DEVICE_ID_JOYPAD_SELECT,
+        RETRO_DEVICE_ID_JOYPAD_L, RETRO_DEVICE_ID_JOYPAD_R,
+        RETRO_DEVICE_ID_JOYPAD_Y, RETRO_DEVICE_ID_JOYPAD_X
     };
-    static bool updated = false;
-    static int prev_state = -1;
-    uint32_t need_samples, need_bytes;
     int i, cur;
 
-    need_samples = SAMPLES_PER_FRAME(player_rate);
-    need_bytes   = BYTES_PER_FRAME(player_rate);
-
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
-        update_variables();
-
     input_poll_cb();
-
     for (i = 0; i < 12; i++) {
         cur = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, buttons[i]);
         btn_down[i] = cur && !btn_held[i];
         btn_held[i] = cur;
     }
+}
 
-    /* track state changes */
-    if (app_state != prev_state)
-        prev_state = app_state;
+/* Button indices */
+enum { BTN_A, BTN_B, BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT,
+       BTN_START, BTN_SELECT, BTN_L, BTN_R, BTN_Y, BTN_X };
+
+static void handle_browser_input(void)
+{
+    if (btn_down[BTN_UP] && browser_sel > 0) {
+        browser_sel--;
+        if (browser_sel < browser_scroll)
+            browser_scroll = browser_sel;
+    }
+    if (btn_down[BTN_DOWN] && browser_sel < browser_count - 1) {
+        browser_sel++;
+        if (browser_sel >= browser_scroll + VISIBLE_ROWS)
+            browser_scroll = browser_sel - VISIBLE_ROWS + 1;
+    }
+    if ((btn_down[BTN_A] || btn_down[BTN_START]) && browser_count > 0) {
+        if (browser_files[browser_sel].is_dir)
+            browser_enter(browser_files[browser_sel].name);
+        else
+            player_play_at(browser_sel);
+    }
+    if (btn_down[BTN_B])
+        browser_back();
+}
+
+static void handle_player_input(void)
+{
+    if (btn_down[BTN_A])
+        player_toggle_pause();
+
+    if (btn_down[BTN_LEFT] || btn_down[BTN_L])
+        player_seek(-5);
+    if (btn_down[BTN_RIGHT] || btn_down[BTN_R])
+        player_seek(5);
+
+    if (btn_down[BTN_UP])
+        player_cycle_mode(-1);
+    if (btn_down[BTN_DOWN])
+        player_cycle_mode(1);
+
+    if (btn_down[BTN_Y])
+        player_mode == MODE_RANDOM ? player_random() : player_prev();
+    if (btn_down[BTN_X])
+        player_mode == MODE_RANDOM ? player_random() : player_next();
+
+    if (btn_down[BTN_B] || btn_down[BTN_START])
+        app_state = STATE_BROWSER;
+}
+
+void retro_run(void)
+{
+    uint32_t need_samples = player_rate / FPS;
+    uint32_t need_bytes = need_samples * 4;
+
+    poll_input();
 
     if (app_state == STATE_BROWSER) {
-        /* navigation */
-        if (btn_down[2] && browser_sel > 0) {
-            browser_sel--;
-            if (browser_sel < browser_scroll)
-                browser_scroll = browser_sel;
-        }
-        if (btn_down[3] && browser_sel < browser_count - 1) {
-            browser_sel++;
-            if (browser_sel >= browser_scroll + VISIBLE_ROWS)
-                browser_scroll = browser_sel - VISIBLE_ROWS + 1;
-        }
-
-        /* select */
-        if ((btn_down[0] || btn_down[6]) && browser_count > 0) {
-            if (browser_files[browser_sel].is_dir) {
-                browser_enter(browser_files[browser_sel].name);
-            } else {
-                player_play_at(browser_sel);
-            }
-        }
-
-        /* back */
-        if (btn_down[1]) {
-            browser_back();
-        }
-
+        handle_browser_input();
         browser_draw();
-    }
-    else if (app_state == STATE_PLAYER) {
-        /* play/pause */
-        if (btn_down[0]) {
-            player_toggle_pause();
-        }
-
-        /* seek */
-        if (btn_down[4] || btn_down[8]) {
-            player_seek(-5);
-        }
-        if (btn_down[5] || btn_down[9]) {
-            player_seek(5);
-        }
-
-        /* mode cycling */
-        if (btn_down[2]) {
-            player_cycle_mode(-1);
-        }
-        if (btn_down[3]) {
-            player_cycle_mode(1);
-        }
-
-        /* prev/next song */
-        if (btn_down[10]) {
-            if (player_mode == MODE_RANDOM)
-                player_random();
-            else
-                player_prev();
-        }
-        if (btn_down[11]) {
-            if (player_mode == MODE_RANDOM)
-                player_random();
-            else
-                player_next();
-        }
-
-        /* back to browser */
-        if (btn_down[1] || btn_down[6]) {
-            app_state = STATE_BROWSER;
-        }
-
-        player_tick_scroll(NULL);
+    } else {
+        handle_player_input();
+        player_tick_scroll();
         player_draw();
     }
 
-    /* continue background loading (runs in any state) */
+    /* background load & decode audio */
     player_bg_load();
+    player_decode(need_bytes);
 
-    /* audio decode - fill PCM buffer */
-    if (!player_paused && player_mad && player_len > 0) {
-        int err = 0;
-
-        while (player_pcm_fill <= need_bytes) {
-            int len = 2048;
-            int rd, done;
-            char *data;
-
-            if (player_pos + len > player_len) {
-                len = player_len - player_pos;
-                if (len <= 128) {
-                    player_on_end();
-                    break;
-                }
-            }
-
-            data = player_get_data(player_pos, len);
-            if (!data) {
-                /* data not loaded yet, wait */
-                break;
-            }
-
-            mad_decode(player_mad, data, len,
-                       (char *)player_pcm + player_pcm_fill, 10000,
-                       &rd, &done, 16, 0);
-
-            player_pcm_fill += done;
-
-            if (done == 0) {
-                rd++;
-                err++;
-                if (err > 65536) break;
-            }
-
-            player_pos += rd;
+    /* output audio if ready */
+    if (player_ready && player_pcm && player_pcm_fill >= need_bytes) {
+        if (RETRO_IS_BIG_ENDIAN) {
+            for (uint32_t i = 0; i < need_samples * 2; i++)
+                player_pcm[i] = SWAP16(player_pcm[i]);
         }
-
-        /* warmup: let decoder fill PCM buffer before outputting */
-        if (player_warmup > 0) {
-            player_warmup--;
-            if (player_warmup == 0)
-                player_loading = 0;  /* hide LOADING screen */
-        }
-
-        /* only output audio after warmup and if we have enough PCM data */
-        if (!player_loading && player_pcm_fill >= need_bytes) {
-            if (RETRO_IS_BIG_ENDIAN) {
-                for (i = 0; i < (int)(need_samples * 2); i++)
-                    player_pcm[i] = SWAP16(player_pcm[i]);
-            }
-
-            audio_batch_cb(player_pcm, need_samples);
-            player_pcm_fill -= need_bytes;
+        audio_batch_cb(player_pcm, need_samples);
+        player_pcm_fill -= need_bytes;
+        if (player_pcm_fill > 0) {
             memmove(player_pcm, (char *)player_pcm + need_bytes, player_pcm_fill);
         }
     }
 
-    video_cb(pixels, width, height, width * sizeof(uint16_t));
+    video_cb(pixels, SCREEN_W, SCREEN_H, SCREEN_W * sizeof(uint16_t));
 }
 
 bool retro_load_game(const struct retro_game_info *info)
 {
     struct retro_input_descriptor desc[] = {
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,   "Rewind"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,     "Mode Up"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,   "Mode Down"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT,  "Forward"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,      "Select/Play"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,      "Back"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,  "Back"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,      "Prev Song"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,      "Next Song"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,      "Seek -5s"},
-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,      "Seek +5s"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "Seek -5s"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "Seek +5s"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "Mode Up"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "Mode Down"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,     "Play/Pause"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,     "Back"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,     "Prev"},
+        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,     "Next"},
         {0},
     };
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
@@ -342,6 +247,7 @@ bool retro_load_game(const struct retro_game_info *info)
     if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
         return false;
 
+    /* direct launch with file */
     if (info && info->path) {
         char *slash = strrchr(info->path, '/');
         if (slash) {
@@ -353,8 +259,8 @@ bool retro_load_game(const struct retro_game_info *info)
             browser_scan();
 
             if (player_load(info->path)) {
-                strncpy(player_song, slash + 1, 127);
-                player_song[127] = '\0';
+                strncpy(player_song, slash + 1, sizeof(player_song) - 1);
+                player_song[sizeof(player_song) - 1] = '\0';
                 player_song_idx = browser_find_song(player_song);
                 player_setup_title();
                 app_state = STATE_PLAYER;
