@@ -4,7 +4,7 @@
 #define MAX_FILES    256
 #define MAX_PATH     512
 #define MAX_NAME     128
-#define VISIBLE_ROWS 8
+#define VISIBLE_ROWS 7
 
 typedef struct {
     char name[MAX_NAME];

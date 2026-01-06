@@ -468,5 +468,6 @@ void player_draw(void)
     /* footer */
     ui_fill(0, SCREEN_H - 32, SCREEN_W, 32, COL_HEADER_BG);
     font_draw_text(pixels, SCREEN_W, SCREEN_H, 12, SCREEN_H - 24, "Y/X PREV/NEXT", COL_DIM);
-    font_draw_text(pixels, SCREEN_W, SCREEN_H, SCREEN_W - 50, SCREEN_H - 24, "B BACK", COL_DIM);
+    tw = font_measure_text("B BACK");
+    font_draw_text(pixels, SCREEN_W, SCREEN_H, SCREEN_W - tw - 12, SCREEN_H - 24, "B BACK", COL_DIM);
 }
